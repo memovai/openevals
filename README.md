@@ -5,6 +5,8 @@ Cheap, fast observability + eval for agent trajectories.
 - **Data model copied from [Langfuse](https://github.com/langfuse/langfuse) (MIT):** `trace → observations (tree) → scores`. Langfuse SDKs can point straight at this server.
 - **One process, one SQLite file.** No ClickHouse / Redis / S3. Uses Node's built-in `node:sqlite`, so there are no native dependencies.
 - **[jev](https://typesafe.ai) is the judge.** jev does not generate text; it answers typed questions (Choice / Score / Noul) with calibrated probabilities. An "LLM-as-judge" rubric is therefore a set of atomic questions asked in **one request per trace**, and the weights / pass rules live in code. ≈ $0.001 per trace, ~1 s.
+- **Every step is graded, not just the outcome.** jev is fast and cheap enough (~100 ms) to judge each tool call and LLM step of a run concurrently. The per-step answers are folded into the trace-level state, so long runs are graded from a complete skeleton instead of a truncated dump, and roll up into credit-assignment metrics (where it first went off track, how much was wasted, how long it stalled, whether it recovered from errors).
+- **Rubrics are designed for jev, with feedback.** Lint, per-question calibration against human verdicts, a backtest endpoint, starter templates per agent type, and a compiler that turns a prose rubric into jev questions. See [docs/designing-for-jev.md](docs/designing-for-jev.md).
 
 ## Run
 
@@ -41,10 +43,11 @@ await eva.flush();
 
 ## How evaluation works
 
-1. Every ingested event re-schedules the trace; after `OPENEVALS_SETTLE_MS` of quiet the worker picks it up.
-2. `eval/state.ts` compacts the trajectory into a JSON `state` under jev's 32k-token budget (per-field truncation → head/tail elision → last-resort clipping). Deterministic, so the state hash is a cache key: identical data is never judged twice.
-3. Each enabled evaluator = one `POST /v1/systemone` with all its questions. Answers become `scores` rows (`source = EVAL`): Noul → numeric P(yes); Score → numeric level (+ probabilities/confidence in metadata); Choice → categorical.
-4. `composite` (in code) turns the atomic answers into `trajectory_quality` (0–1) and `passed` (boolean).
+1. Every ingested event re-schedules the trace; after `OPENEVALS_SETTLE_MS` of quiet the worker picks it up. For one trace the evaluators run in order: code graders (free) → per-step graders → trace-level graders; different traces run concurrently.
+2. **Per-step grading.** The `step` evaluator judges every TOOL and GENERATION step with one small jev request each, `OPENEVALS_STEP_CONCURRENCY` (8) at a time. Each step's state is the task, the step, the previous `OPENEVALS_STEP_CONTEXT` (8) steps with clipped input/output, and the most recent earlier error. Runs longer than `OPENEVALS_STEP_MAX` (150) steps are sampled evenly. Answers attach to the observation; code rolls them up into trace-level metrics (`progress_mean`, `longest_stall`, `wasted_fraction`, `first_off_task_step`, `error_recovery_rate`, …).
+3. `eval/state.ts` compacts the trajectory into a JSON `state` under jev's 32k-token budget: per-field truncation → keep head and tail steps with input/output while the **middle steps stay as a digest** (name, level, per-step `judgments`) → counter-only elision → last-resort clipping. The per-step answers and their `step_summary` ride along, so the trace-level grader sees every step. Deterministic, so the state hash is a cache key: identical data is never judged twice.
+4. Each enabled evaluator = one `POST /v1/systemone` with all its questions. Answers become `scores` rows (`source = EVAL`): Noul → numeric P(yes); Score → numeric level (+ probabilities/confidence in metadata); Choice → categorical.
+5. `composite` (in code) turns the atomic answers into `trajectory_quality` (0–1) and `passed` (boolean). Per-step metrics are diagnostics; pass/fail comes from the outcome.
 5. **Escalation.** If jev's minimum `confidence` is below `OPENEVALS_REVIEW_CONFIDENCE` (or a Noul lands within `OPENEVALS_ESCALATE_NOUL_BAND` of 0.5), the same state and questions go to a reasoning model (`claude-opus-5` by default, needs `ANTHROPIC_API_KEY`) with a strict JSON output schema. Its answers replace the jev scores and its **rationale** lands in each score's `comment`. Without an escalator the judgment is just flagged `needs_review`. Force a second opinion any time with `POST /api/v1/traces/:id/escalate`.
 6. The exact `state`, `questions`, raw `answers`, model version, tokens, cost, latency are stored in `judgments` for audit. An escalation judgment points at the jev judgment it replaced via `escalated_from`.
 
@@ -57,9 +60,10 @@ await eva.flush();
 | name | runs on | questions |
 |---|---|---|
 | `sanity` | every trace, **code grader, free** | `output_nonempty`, `no_unresolved_error`, `max_steps ≤ 200`, `max_repeated_tool_call ≤ 5` → `sanity_score`, `sanity_passed` |
+| `step` | every `TOOL` and `GENERATION` observation, concurrently | `progress` (Score 0–2: regressed / none / progress), `on_task`, `redundant`, `corrective` (Noul) → per-step `step_quality`; trace-level roll-ups `progress_mean`, `longest_stall`, `wasted_fraction`, `first_off_task_step`, `off_task_steps`, `error_recovery_rate`, `mean_steps_to_recover`, `step_quality_mean` |
 | `trajectory` | every trace | `task_completion` (Score 0–2), `instruction_following`, `grounded_in_evidence`, `wasted_effort` (Score 0–2), `tool_use_appropriate`, `recovered_from_errors`, `unsafe_or_out_of_scope_action` (Noul), `failure_mode` (Choice) → composite `trajectory_quality`, `passed` |
 | `outcome` | traces with `expected_output` | `matches_expected`, `match_quality` (Score 0–2), `contradicts_expected` → `outcome_quality`, `outcome_passed` |
-| `tool_call` | every `TOOL` observation (**disabled by default**: one request per tool call) | `arguments_appropriate`, `result_usefulness` (Score 0–2), `redundant_call` → `tool_call_quality` |
+| `tool_call` | every `TOOL` observation (**disabled by default**: overlaps with `step`) | `arguments_appropriate`, `result_usefulness` (Score 0–2), `redundant_call` → `tool_call_quality` |
 
 ### Code graders (deterministic, free)
 
@@ -100,7 +104,32 @@ curl -X POST localhost:3100/api/v1/evaluators -H 'content-type: application/json
 }'
 ```
 
-Trace-level questions see `task`, `final_output`, `expected_output` (if any), `trajectory[]` (`type`, `name`, `input`, `output`, `level`, `status_message`, `duration_ms`), and `stats`. Observation-level questions (`"target": "observation"`) see `task`, `step`, and `context`. Write questions in English (jev's strongest language); the trajectory itself can be in any language. Transforms: `noul`, `noul_inverted`, `score_norm`, `score_norm_inverted`, `choice_is` (with `option`).
+Trace-level questions see `task`, `final_output`, `expected_output` (if any), `trajectory[]` (`type`, `name`, `input`, `output`, `level`, `status_message`, `duration_ms`, per-step `judgments`), `stats` and `step_summary`. Observation-level questions (`"target": "observation"`) see `task`, `step`, and `context` (`previous_steps` with clipped I/O, `previous_steps_omitted`, `last_error`, `final_output`). Write questions in English (jev's strongest language); the trajectory itself can be in any language. Transforms: `noul`, `noul_inverted`, `score_norm`, `score_norm_inverted`, `choice_is` (with `option`).
+
+Creating an evaluator runs **lint** first: errors (a composite term pointing at a missing question, a transform of the wrong type, a numeric "rate 1–10" scale, a field that only exists in the other target's state) return 422 with the findings; `?force=1` saves anyway. Warnings and notes come back with the saved evaluator and are shown on `/evaluators`.
+
+### Designing rubrics for jev: templates, compiler, per-question calibration
+
+jev answers one typed question at a time, from the state alone, without reasoning or prose. A rubric written for a text-generating judge ("rate the overall quality and explain") has to be decomposed. openevals gives you three ways in, and a feedback loop ([docs/designing-for-jev.md](docs/designing-for-jev.md) has the full guide and conversion table):
+
+```bash
+# 1. start from a template (coding-agent · research-agent · support-agent · browser-agent)
+curl localhost:3100/api/v1/templates
+curl -X POST localhost:3100/api/v1/evaluators/from-template -H 'content-type: application/json' \
+  -d '{"template":"coding-agent","name":"my-coder","filter":{"names":["my-agent"]}}'
+
+# 2. compile a prose rubric into jev questions + composite (needs ANTHROPIC_API_KEY); linted and repaired once
+curl -X POST localhost:3100/api/v1/evaluators/compile -H 'content-type: application/json' \
+  -d '{"name":"refund-agent","rubric":"Verify the order before refunding; never refund over $200 without escalating; stay polite.","save":true}'
+
+# 3. lint a draft without saving
+curl -X POST localhost:3100/api/v1/evaluators/lint -H 'content-type: application/json' -d '{"questions":{...},"composite":{...}}'
+
+# then: which question should I rewrite? (undecided / low-confidence rate, constancy, AUC vs the human verdict, false passes)
+curl localhost:3100/api/v1/calibration/questions?evaluator=refund-agent
+# re-run an edited evaluator on the latest human-labeled traces, cache bypassed, and get the same diagnostics
+curl -X POST localhost:3100/api/v1/evaluators/refund-agent/backtest?limit=30
+```
 
 ## Datasets, trials, pass@k / pass^k
 
@@ -119,6 +148,8 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 
 - `/review` lists traces that failed, had low-confidence judgments, or errored. Read the transcript; press **pass** / **fail** on the trace page (or `POST /api/v1/scores` with `name: "passed"`) — that writes an ANNOTATION score.
 - `/calibration` (`GET /api/v1/calibration`) compares every EVAL score against the ANNOTATION of the same name on the same trace: agreement, Cohen's κ, MAE, Pearson r, and **false pass** (grader said pass, human said fail — the direction that hides real failures). This is how you know whether to trust jev on your domain and where to tighten a rubric.
+- The second table on `/calibration` (`GET /api/v1/calibration/questions`) looks at **each jev question on its own**: how often jev is undecided or unconfident on it (vague criteria), whether its answer is nearly constant on your traffic (not discriminating), how well it separates human-pass from human-fail traces (AUC), and how many false passes it produces, with a plain-language diagnosis of what to change. `POST /api/v1/evaluators/:id/backtest` re-measures an edited evaluator on the labeled traces before it touches production.
+- The trace page shows a per-step **progress strip** (green progress · amber none · red regressed; off-task steps outlined) with the roll-up line under it, so the first place a long run went wrong is one glance away.
 
 ## How this maps to Anthropic's "Demystifying evals for AI agents"
 
@@ -126,12 +157,13 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 |---|---|
 | Three grader types: code, model, human | `kind: "code"` evaluators (free), jev evaluators (typed questions), ANNOTATION scores via UI/API |
 | "grade each dimension with an isolated LLM-as-judge" | jev evaluates every question independently against the same state — one request, isolated judgments by construction |
+| Long-horizon agents: per-step signal without brittle step-matching | `step` evaluator grades every step concurrently; answers fold into the trace-level state and roll up into progress / stall / waste / recovery metrics that diagnose, while pass/fail stays on the outcome |
 | "give the grader a way out" | Noul ≈ 0.5 and low `confidence` trigger `needs_review` / escalation; `failure_mode` has `cannot_determine` |
 | Partial credit, weighted / binary / hybrid scoring | `composite.terms` (weighted) + `composite.pass` (binary gates) |
 | Grade outcomes, avoid brittle step-checking | trajectory evaluator weights `task_completion` 0.4, process questions low; code checks target output/state |
 | Trials, pass@k, pass^k, broken-task detection | dataset runs report all three; `suspect_broken` on 0/k items |
 | Capability → regression graduation | `?compare=<run>` returns `regressions` / `fixes`; run pass^k against your regression set in CI |
-| Calibrate model graders against humans | `/calibration` on paired EVAL / ANNOTATION scores |
+| Calibrate model graders against humans | `/calibration` on paired EVAL / ANNOTATION scores; per-question AUC / undecided rate / false passes; `backtest` an edited rubric on labeled traces |
 | Read the transcripts | `/review` queue, full trajectory tree, exact state and answers stored per judgment |
 
 ## API
@@ -146,7 +178,14 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 | POST | `/api/v1/traces/:id/evaluate?evaluator=&force=1` | judge now, synchronously |
 | POST | `/api/v1/traces/:id/escalate?evaluator=` | reasoning-model second opinion on the latest judgment(s) |
 | POST | `/api/v1/scores` | manual annotation |
-| GET/POST/PATCH/DELETE | `/api/v1/evaluators[/:id]` | manage evaluators (`PATCH {enabled}`) |
+| GET/POST/PATCH/DELETE | `/api/v1/evaluators[/:id]` | manage evaluators (`PATCH {enabled}`); POST lints first (422 on errors, `?force=1`) |
+| POST | `/api/v1/evaluators/lint` | lint an evaluator body without saving |
+| GET | `/api/v1/evaluators/:id/lint` | lint findings for a saved evaluator |
+| POST | `/api/v1/evaluators/:id/backtest?limit=` | re-run on the latest human-labeled traces (cache bypassed) + per-question diagnostics |
+| GET | `/api/v1/templates[/:id]` | starter rubrics per agent type |
+| POST | `/api/v1/evaluators/from-template` | copy a template under your name/filter |
+| POST | `/api/v1/evaluators/compile` | prose rubric → jev evaluator (`{name, rubric, agent?, examples?, target?, filter?, save?}`; needs `ANTHROPIC_API_KEY`) |
+| GET | `/api/v1/calibration/questions?evaluator=` | per-question diagnostics and rewrite suggestions |
 | POST | `/api/v1/datasets`, `/api/v1/datasets/:name/items` | reference sets |
 | POST | `/api/v1/datasets/:name/runs/:run/items` | link a trace to an item; copies `expected_output` onto the trace so `outcome` grades it |
 | GET | `/api/v1/datasets/:name/runs` | list runs |
@@ -155,7 +194,7 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 | GET | `/api/v1/calibration` | grader-vs-human agreement per score |
 | GET | `/api/v1/stats`, `/api/v1/health` | |
 
-UI: `/` traces, `/traces/:id` trajectory tree + probability bars per question + human verdict, `/review`, `/evaluators`, `/datasets` (pass@k table), `/calibration`.
+UI: `/` traces, `/traces/:id` progress strip + trajectory tree + probability bars per question + human verdict, `/review`, `/evaluators` (with lint and templates), `/datasets` (pass@k table), `/calibration` (score-level and per-question tables).
 
 ## Layout
 
@@ -178,7 +217,12 @@ src/
   eval/code.ts     deterministic code graders
   eval/metrics.ts  pass@k / pass^k / regressions / calibration
   eval/aggregate.ts answers → scores, composite, pass rules
-  eval/worker.ts   queue, caching, scheduling
+  eval/steps.ts    per-step answers → trace state judgments + credit-assignment roll-ups
+  eval/lint.ts     static checks for jev-shaped rubrics
+  eval/diagnostics.ts per-question calibration (undecided rate, constancy, AUC vs human verdict)
+  eval/templates.ts starter rubrics per agent type
+  eval/compile.ts  prose rubric → jev questions (Claude, structured output, lint + one repair)
+  eval/worker.ts   queue, per-trace ordering, concurrent per-step judging, caching
   sdk/index.ts     client SDK
 ```
 

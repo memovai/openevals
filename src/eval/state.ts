@@ -21,13 +21,31 @@ export interface TrajectoryStep {
   model?: string;
   input?: unknown;
   output?: unknown;
+  /** per-step answers from observation-level evaluators (fast first pass), folded in for trace-level grading */
+  judgments?: Record<string, number | string>;
 }
+
+/** A step whose input/output were dropped to fit the budget; skeleton + per-step judgments remain. */
+export interface DigestStep {
+  i: number;
+  type: string;
+  name: string | null;
+  depth: number;
+  elided: true;
+  level?: string;
+  status_message?: string;
+  judgments?: Record<string, number | string>;
+}
+
+export type StepJudgments = Map<string, Record<string, number | string>>; // observation id → answers
 
 export interface TraceState {
   task: unknown;
   expected_output?: unknown;
   final_output: unknown;
-  trajectory: (TrajectoryStep | { omitted_steps: number })[];
+  trajectory: (TrajectoryStep | DigestStep | { omitted_steps: number })[];
+  /** code-computed roll-up of the per-step judgments (see eval/steps.ts) */
+  step_summary?: Record<string, number | string | null>;
   stats: {
     steps: number;
     llm_calls: number;
@@ -44,7 +62,12 @@ export interface StateMeta {
   truncated: boolean;
   field_cap: number | null;
   steps_total: number;
+  /** steps present with input/output (digest steps are not counted) */
   steps_kept: number;
+  /** steps present only as a digest (no input/output) */
+  steps_digested?: number;
+  /** number of steps that carried per-step judgments */
+  steps_judged?: number;
 }
 
 const LLM_TYPES = new Set(["GENERATION"]);
@@ -88,7 +111,7 @@ function ms(a: string | null, b: string | null): number | null {
   return Number.isFinite(d) ? d : null;
 }
 
-export function buildSteps(observations: ObservationRow[]): TrajectoryStep[] {
+export function buildSteps(observations: ObservationRow[], judgments?: StepJudgments): TrajectoryStep[] {
   const byId = new Map(observations.map((o) => [o.id, o]));
   return observations.map((o, i) => {
     const step: TrajectoryStep = {
@@ -103,8 +126,18 @@ export function buildSteps(observations: ObservationRow[]): TrajectoryStep[] {
     if (o.model) step.model = o.model;
     if (o.input !== null && o.input !== undefined) step.input = o.input;
     if (o.output !== null && o.output !== undefined) step.output = o.output;
+    const jd = judgments?.get(o.id);
+    if (jd && Object.keys(jd).length) step.judgments = jd;
     return step;
   });
+}
+
+function digest(s: TrajectoryStep): DigestStep {
+  const d: DigestStep = { i: s.i, type: s.type, name: s.name, depth: s.depth, elided: true };
+  if (s.level) d.level = s.level;
+  if (s.status_message) d.status_message = s.status_message;
+  if (s.judgments) d.judgments = s.judgments;
+  return d;
 }
 
 function stats(trace: TraceRow, observations: ObservationRow[]): TraceState["stats"] {
@@ -145,8 +178,16 @@ function stats(trace: TraceRow, observations: ObservationRow[]): TraceState["sta
 
 const FIELD_CAPS = [4000, 1500, 600, 250, 100];
 
-export function buildTraceState(trace: TraceRow, observations: ObservationRow[], budgetChars: number): { state: TraceState; meta: StateMeta } {
-  const allSteps = buildSteps(observations);
+export interface TraceStateOptions {
+  /** per-step answers from observation-level evaluators, keyed by observation id */
+  stepJudgments?: StepJudgments;
+  /** roll-up of those answers computed in code */
+  stepSummary?: Record<string, number | string | null>;
+}
+
+export function buildTraceState(trace: TraceRow, observations: ObservationRow[], budgetChars: number, opts: TraceStateOptions = {}): { state: TraceState; meta: StateMeta } {
+  const allSteps = buildSteps(observations, opts.stepJudgments);
+  const judged = allSteps.filter((s) => s.judgments).length;
   const base = (steps: TraceState["trajectory"], taskCap: number | null): TraceState => {
     const st: TraceState = {
       task: taskCap ? clip(trace.input, taskCap) : trace.input,
@@ -157,15 +198,25 @@ export function buildTraceState(trace: TraceRow, observations: ObservationRow[],
     if (trace.expected_output !== null && trace.expected_output !== undefined) {
       st.expected_output = taskCap ? clip(trace.expected_output, taskCap) : trace.expected_output;
     }
+    if (opts.stepSummary && Object.keys(opts.stepSummary).length) st.step_summary = opts.stepSummary;
     return st;
   };
   const size = (s: TraceState) => JSON.stringify(s).length;
+  const metaOf = (chars: number, truncated: boolean, field_cap: number | null, kept: number, digested = 0): StateMeta => ({
+    chars,
+    truncated,
+    field_cap,
+    steps_total: allSteps.length,
+    steps_kept: kept,
+    ...(digested ? { steps_digested: digested } : {}),
+    ...(judged ? { steps_judged: judged } : {}),
+  });
 
   // 1. untouched
   let state = base(allSteps, null);
   let chars = size(state);
   if (chars <= budgetChars) {
-    return { state, meta: { chars, truncated: false, field_cap: null, steps_total: allSteps.length, steps_kept: allSteps.length } };
+    return { state, meta: metaOf(chars, false, null, allSteps.length) };
   }
 
   // 2. progressively cap each step's input/output
@@ -177,12 +228,28 @@ export function buildTraceState(trace: TraceRow, observations: ObservationRow[],
     state = base(capped, null);
     chars = size(state);
     if (chars <= budgetChars) {
-      return { state, meta: { chars, truncated: true, field_cap: cap, steps_total: allSteps.length, steps_kept: allSteps.length } };
+      return { state, meta: metaOf(chars, true, cap, allSteps.length) };
     }
   }
 
-  // 3. head + tail, shrink the window until it fits
+  // 3. head + tail keep their input/output; the middle stays as a digest (skeleton + per-step
+  //    judgments), so the trace-level grader still sees every step and what the step grader said.
   let keep = Math.max(2, Math.floor(capped.length / 2));
+  while (keep >= 2) {
+    const head = Math.ceil(keep / 2);
+    const tail = keep - head;
+    const middle = capped.slice(head, capped.length - tail).map(digest);
+    const steps: TraceState["trajectory"] = [...capped.slice(0, head), ...middle, ...(tail > 0 ? capped.slice(capped.length - tail) : [])];
+    state = base(steps, null);
+    chars = size(state);
+    if (chars <= budgetChars) {
+      return { state, meta: metaOf(chars, true, cap, keep, middle.length) };
+    }
+    keep = Math.floor(keep / 2);
+  }
+
+  // 3b. even the digest is too long (thousands of steps): elide the middle with a counter
+  keep = Math.max(2, Math.floor(capped.length / 2));
   while (keep >= 2) {
     const head = Math.ceil(keep / 2);
     const tail = keep - head;
@@ -194,7 +261,7 @@ export function buildTraceState(trace: TraceRow, observations: ObservationRow[],
     state = base(steps, null);
     chars = size(state);
     if (chars <= budgetChars) {
-      return { state, meta: { chars, truncated: true, field_cap: cap, steps_total: allSteps.length, steps_kept: keep } };
+      return { state, meta: metaOf(chars, true, cap, keep) };
     }
     keep = Math.floor(keep / 2);
   }
@@ -204,7 +271,7 @@ export function buildTraceState(trace: TraceRow, observations: ObservationRow[],
   const perField = Math.max(500, Math.floor(budgetChars / 4));
   state = base(steps, perField);
   chars = size(state);
-  return { state, meta: { chars, truncated: true, field_cap: cap, steps_total: allSteps.length, steps_kept: Math.min(2, capped.length) } };
+  return { state, meta: metaOf(chars, true, cap, Math.min(2, capped.length)) };
 }
 
 export function hashState(state: unknown): string {
@@ -213,14 +280,30 @@ export function hashState(state: unknown): string {
 
 // ---------------------------------------------------------------------------
 // Observation-level state: one step in focus, with just enough surrounding
-// context (the task, what happened before, what the run finally returned).
+// context to judge it on its own: the task, the last few steps WITH clipped
+// input/output (what the agent knew at this point), the most recent error
+// before this step, and what the run finally returned.
+export interface PreviousStep {
+  i: number;
+  type: string;
+  name: string | null;
+  level?: string;
+  status_message?: string;
+  input?: unknown;
+  output?: unknown;
+}
+
 export interface ObservationState {
   task: unknown;
   step: TrajectoryStep;
   context: {
     position: string; // "step 4 of 12"
     parent: string | null;
-    previous_steps: { i: number; type: string; name: string | null; level?: string }[];
+    previous_steps: PreviousStep[];
+    /** steps before the window that are not shown */
+    previous_steps_omitted: number;
+    /** most recent ERROR step before this one (so "is this step a recovery?" is answerable) */
+    last_error: { i: number; name: string | null; status_message: string | null } | null;
     final_output: unknown;
   };
 }
@@ -230,34 +313,61 @@ export function buildObservationState(
   observations: ObservationRow[],
   target: ObservationRow,
   budgetChars: number,
+  window = 8,
 ): { state: ObservationState; meta: StateMeta } {
   const steps = buildSteps(observations);
   const idx = observations.findIndex((o) => o.id === target.id);
   const step = steps[idx] ?? buildSteps([target])[0]!;
   const parent = target.parent_observation_id ? observations.find((o) => o.id === target.parent_observation_id) : undefined;
-  const prev = steps.slice(Math.max(0, idx - 12), Math.max(0, idx)).map((s) => {
-    const p: ObservationState["context"]["previous_steps"][number] = { i: s.i, type: s.type, name: s.name };
-    if (s.level) p.level = s.level;
-    return p;
-  });
-  const make = (cap: number | null): ObservationState => ({
+  const from = Math.max(0, idx - window);
+  const prevRaw = steps.slice(from, Math.max(0, idx));
+  let lastError: ObservationState["context"]["last_error"] = null;
+  for (let k = idx - 1; k >= 0; k--) {
+    const o = observations[k]!;
+    if (o.level === "ERROR") {
+      lastError = { i: k, name: o.name, status_message: o.status_message };
+      break;
+    }
+  }
+  const prev = (ioCap: number): PreviousStep[] =>
+    prevRaw.map((s) => {
+      const p: PreviousStep = { i: s.i, type: s.type, name: s.name };
+      if (s.level) p.level = s.level;
+      if (s.status_message) p.status_message = s.status_message;
+      if (ioCap > 0) {
+        if (s.input !== undefined) p.input = clip(s.input, ioCap);
+        if (s.output !== undefined) p.output = clip(s.output, ioCap);
+      }
+      return p;
+    });
+  const make = (cap: number | null, prevCap: number): ObservationState => ({
     task: cap ? clip(trace.input, cap) : trace.input,
     step: cap ? { ...step, input: clip(step.input, cap), output: clip(step.output, cap) } : step,
     context: {
       position: `step ${idx + 1} of ${observations.length}`,
       parent: parent?.name ?? null,
-      previous_steps: prev,
+      previous_steps: prev(prevCap),
+      previous_steps_omitted: from,
+      last_error: lastError,
       final_output: cap ? clip(trace.output, cap) : trace.output,
     },
   });
-  let state = make(null);
-  let chars = JSON.stringify(state).length;
-  if (chars <= budgetChars) return { state, meta: { chars, truncated: false, field_cap: null, steps_total: observations.length, steps_kept: 1 } };
-  for (const c of [8000, 3000, 1000, 400]) {
-    state = make(c);
-    chars = JSON.stringify(state).length;
-    if (chars <= budgetChars) return { state, meta: { chars, truncated: true, field_cap: c, steps_total: observations.length, steps_kept: 1 } };
+  const meta = (st: ObservationState, cap: number | null): { state: ObservationState; meta: StateMeta } => ({
+    state: st,
+    meta: { chars: JSON.stringify(st).length, truncated: cap !== null, field_cap: cap, steps_total: observations.length, steps_kept: 1 },
+  });
+  // previous steps carry ~400 chars of input/output each; shrink them first, then the focus step
+  let state = make(null, 400);
+  if (JSON.stringify(state).length <= budgetChars) return meta(state, null);
+  for (const [c, pc] of [
+    [8000, 300],
+    [3000, 200],
+    [1000, 120],
+    [400, 0],
+  ] as const) {
+    state = make(c, pc);
+    if (JSON.stringify(state).length <= budgetChars) return meta(state, c);
   }
-  state = make(Math.max(200, Math.floor(budgetChars / 6)));
-  return { state, meta: { chars: JSON.stringify(state).length, truncated: true, field_cap: Math.floor(budgetChars / 6), steps_total: observations.length, steps_kept: 1 } };
+  const last = Math.max(200, Math.floor(budgetChars / 6));
+  return meta(make(last, 0), last);
 }

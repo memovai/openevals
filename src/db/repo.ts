@@ -362,6 +362,11 @@ export class Repo {
     else this.db.prepare("DELETE FROM scores WHERE trace_id = ? AND evaluator_id = ? AND observation_id = ? AND source = 'EVAL'").run(traceId, evaluatorId, observationId);
   }
 
+  /** Trace-level EVAL scores of one evaluator only (keeps its observation-level scores). */
+  deleteTraceLevelEvalScores(traceId: string, evaluatorId: string): void {
+    this.db.prepare("DELETE FROM scores WHERE trace_id = ? AND evaluator_id = ? AND observation_id IS NULL AND source = 'EVAL'").run(traceId, evaluatorId);
+  }
+
   listScores(traceId: string): ScoreRow[] {
     return (this.db.prepare("SELECT * FROM scores WHERE trace_id = ? ORDER BY timestamp ASC").all(traceId) as Raw[]).map(scoreFromRaw);
   }
@@ -561,6 +566,23 @@ export class Repo {
       .run(retryAt ? "pending" : "failed", error.slice(0, 2000), retryAt, nowIso(), traceId, evaluatorId);
   }
 
+  /** Queue rows for this trace that belong to enabled observation-level evaluators and are not finished yet. */
+  pendingObservationEvals(traceId: string): QueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT q.* FROM eval_queue q JOIN evaluators e ON e.id = q.evaluator_id
+         WHERE q.trace_id = ? AND q.status IN ('pending','running') AND e.enabled = 1 AND e.target = 'observation'`,
+      )
+      .all(traceId) as unknown as QueueRow[];
+  }
+
+  /** Put a claimed row back to pending without counting an attempt (used to wait for per-step grading). */
+  deferQueue(traceId: string, evaluatorId: string, notBefore: string): void {
+    this.db
+      .prepare("UPDATE eval_queue SET status = 'pending', not_before = ?, updated_at = ? WHERE trace_id = ? AND evaluator_id = ? AND status = 'running'")
+      .run(notBefore, nowIso(), traceId, evaluatorId);
+  }
+
   queueStats(): Record<string, number> {
     const rows = this.db.prepare("SELECT status, COUNT(*) AS n FROM eval_queue GROUP BY status").all() as { status: string; n: number }[];
     return Object.fromEntries(rows.map((r) => [r.status, Number(r.n)]));
@@ -655,6 +677,50 @@ export class Repo {
          WHERE e.source = 'EVAL' AND e.observation_id IS NULL AND h.observation_id IS NULL`,
       )
       .all() as never;
+  }
+
+  /** Every trace-level EVAL score from a jev/escalated judgment, with the evaluator name and the human `passed` verdict on the same trace (if any). */
+  questionScoreRows(opts: { evaluator?: string; traceIds?: string[] } = {}): { trace_id: string; evaluator: string; name: string; value: number | null; string_value: string | null; metadata: Record<string, unknown> | null; human: number | null }[] {
+    const where: string[] = ["s.source = 'EVAL'", "s.observation_id IS NULL", "s.evaluator_id IS NOT NULL", "json_extract(s.metadata, '$.kind') IN ('noul','score','choice')"];
+    const args: unknown[] = [];
+    if (opts.evaluator) {
+      where.push("e.name = ?");
+      args.push(opts.evaluator);
+    }
+    if (opts.traceIds) {
+      if (!opts.traceIds.length) return [];
+      where.push(`s.trace_id IN (${opts.traceIds.map(() => "?").join(",")})`);
+      args.push(...opts.traceIds);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT s.trace_id, e.name AS evaluator, s.name, s.value, s.string_value, s.metadata,
+                (SELECT h.value FROM scores h WHERE h.trace_id = s.trace_id AND h.source = 'ANNOTATION' AND h.name = 'passed' AND h.observation_id IS NULL ORDER BY h.timestamp DESC LIMIT 1) AS human
+         FROM scores s JOIN evaluators e ON e.id = s.evaluator_id
+         WHERE ${where.join(" AND ")}`,
+      )
+      .all(...(args as never[])) as Raw[];
+    return rows.map((r) => ({
+      trace_id: String(r.trace_id),
+      evaluator: String(r.evaluator),
+      name: String(r.name),
+      value: r.value === null ? null : Number(r.value),
+      string_value: r.string_value === null ? null : String(r.string_value),
+      metadata: pj<Record<string, unknown>>(r.metadata),
+      human: r.human === null || r.human === undefined ? null : Number(r.human),
+    }));
+  }
+
+  /** Traces with a human `passed` verdict, newest first — the labeled set for backtesting an evaluator. */
+  annotatedTraceIds(limit = 50): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT DISTINCT s.trace_id FROM scores s JOIN traces t ON t.id = s.trace_id
+           WHERE s.source = 'ANNOTATION' AND s.name = 'passed' AND s.observation_id IS NULL ORDER BY t.timestamp DESC LIMIT ?`,
+        )
+        .all(limit) as { trace_id: string }[]
+    ).map((r) => r.trace_id);
   }
 
   listRunItems(datasetId: string, runName: string): Raw[] {

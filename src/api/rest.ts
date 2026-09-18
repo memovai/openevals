@@ -3,16 +3,26 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Repo } from "../db/repo.js";
-import { evaluateTrace, escalateJudgment, type Judges } from "../eval/worker.js";
+import { evaluateTrace, escalateJudgment, orderEvaluators, stepContext, type Judges } from "../eval/worker.js";
 import { buildTraceState } from "../eval/state.js";
 import { runReport, compareRuns, calibration } from "../eval/metrics.js";
+import { questionDiagnostics } from "../eval/diagnostics.js";
+import { lintEvaluator, hasErrors } from "../eval/lint.js";
+import { templates, templateById } from "../eval/templates.js";
+import { compileRubric, type Compiler } from "../eval/compile.js";
 import { config } from "../config.js";
 
-export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: string, settleMs?: number) => void): Hono {
+export interface RestOptions {
+  /** natural-language rubric → jev evaluator; null disables POST /api/v1/evaluators/compile */
+  compiler?: Compiler | null;
+}
+
+export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: string, settleMs?: number) => void, opts: RestOptions = {}): Hono {
   const app = new Hono();
   const judge = judges.judge;
+  const compiler = opts.compiler ?? null;
 
-  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges.escalator?.model ?? null, codeGraders: true }));
+  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges.escalator?.model ?? null, compiler: compiler?.model ?? null, codeGraders: true }));
 
   app.get("/api/v1/stats", (c) =>
     c.json({ traces: repo.countTraces(), scores: repo.scoreStats(), judgments: repo.judgmentStats(), queue: repo.queueStats() }),
@@ -43,7 +53,8 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
   app.get("/api/v1/traces/:id/state", (c) => {
     const t = repo.getTrace(c.req.param("id"));
     if (!t) return c.json({ error: "not found" }, 404);
-    return c.json(buildTraceState(t, repo.listObservations(t.id), config.stateBudgetChars));
+    const obs = repo.listObservations(t.id);
+    return c.json(buildTraceState(t, obs, config.stateBudgetChars, stepContext(repo, t, obs)));
   });
 
   /** Force (re-)evaluation now. ?evaluator=<name> to limit; ?force=1 to bypass the hash cache. */
@@ -52,7 +63,7 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
     if (!t) return c.json({ error: "not found" }, 404);
     const only = c.req.query("evaluator");
     const force = c.req.query("force") === "1";
-    const evs = repo.listEvaluators(true).filter((e) => !only || e.name === only);
+    const evs = orderEvaluators(repo.listEvaluators(true).filter((e) => !only || e.name === only));
     const results: Record<string, unknown> = {};
     for (const ev of evs) results[ev.name] = await evaluateTrace(repo, judges, ev, t.id, { force });
     return c.json({ traceId: t.id, results });
@@ -137,10 +148,97 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
     composite: z.unknown().optional(),
     enabled: z.boolean().optional(),
   });
-  app.get("/api/v1/evaluators", (c) => c.json({ data: repo.listEvaluators() }));
+  const lintOf = (e: { kind: "jev" | "code"; target: "trace" | "observation"; filter: unknown; questions: Record<string, unknown>; composite: unknown }) =>
+    lintEvaluator({ kind: e.kind, target: e.target, filter: e.filter as never, questions: e.questions, composite: e.composite });
+  app.get("/api/v1/evaluators", (c) => c.json({ data: repo.listEvaluators().map((e) => ({ ...e, lint: lintOf(e) })) }));
+
+  /** Lint an evaluator body without saving it (same shape as POST /api/v1/evaluators). */
+  app.post("/api/v1/evaluators/lint", async (c) => {
+    const p = evaluatorBody.partial({ name: true }).safeParse(await c.req.json());
+    if (!p.success) return c.json({ error: p.error.message }, 400);
+    const kind = p.data.kind ?? (p.data.checks ? "code" : "jev");
+    const questions = kind === "code" ? { checks: p.data.checks ?? [] } : (p.data.questions ?? {});
+    const findings = lintEvaluator({ kind, target: p.data.target ?? "trace", filter: p.data.filter ?? null, questions, composite: p.data.composite ?? null });
+    return c.json({ ok: !hasErrors(findings), findings });
+  });
+
+  /** Starter rubrics per agent type, already shaped for jev. */
+  app.get("/api/v1/templates", (c) => c.json({ data: templates.map((t) => ({ id: t.id, title: t.title, description: t.description, target: t.target, questions: Object.keys(t.questions), composite: t.composite.name })) }));
+  app.get("/api/v1/templates/:id", (c) => {
+    const t = templateById(c.req.param("id"));
+    return t ? c.json(t) : c.json({ error: "not found" }, 404);
+  });
+  /** Copy a template under your own name (+ filter) as an editable evaluator. */
+  app.post("/api/v1/evaluators/from-template", async (c) => {
+    const p = z.object({ template: z.string(), name: z.string().min(1), filter: evaluatorBody.shape.filter, enabled: z.boolean().optional() }).safeParse(await c.req.json());
+    if (!p.success) return c.json({ error: p.error.message }, 400);
+    const t = templateById(p.data.template);
+    if (!t) return c.json({ error: `unknown template; one of ${templates.map((x) => x.id).join(", ")}` }, 404);
+    if (repo.getEvaluatorByName(p.data.name)?.builtin) return c.json({ error: "cannot overwrite a builtin evaluator" }, 409);
+    const row = repo.upsertEvaluator({ name: p.data.name, description: `${t.title}: ${t.description} (from template ${t.id})`, kind: "jev", target: t.target, filter: p.data.filter ?? t.filter ?? null, questions: t.questions, composite: t.composite, enabled: p.data.enabled ?? true });
+    return c.json({ ...row, lint: lintOf(row) }, 201);
+  });
+
+  /**
+   * Compile a natural-language rubric into a jev evaluator (typed atomic questions + composite), lint it,
+   * and optionally save it. Needs ANTHROPIC_API_KEY. Body: { name, rubric, target?, agent?, examples?, filter?, save? }.
+   */
+  app.post("/api/v1/evaluators/compile", async (c) => {
+    if (!compiler) return c.json({ error: "rubric compiler disabled: ANTHROPIC_API_KEY not set" }, 503);
+    const p = z
+      .object({
+        name: z.string().min(1),
+        rubric: z.string().min(1),
+        target: z.enum(["trace", "observation"]).optional(),
+        agent: z.string().optional(),
+        examples: z.array(z.object({ summary: z.string(), verdict: z.enum(["pass", "fail"]), why: z.string().optional() })).optional(),
+        filter: evaluatorBody.shape.filter,
+        save: z.boolean().optional(),
+      })
+      .safeParse(await c.req.json());
+    if (!p.success) return c.json({ error: p.error.message }, 400);
+    if (repo.getEvaluatorByName(p.data.name)?.builtin) return c.json({ error: "cannot overwrite a builtin evaluator" }, 409);
+    try {
+      const out = await compileRubric(compiler, { name: p.data.name, rubric: p.data.rubric, target: p.data.target, agent: p.data.agent, examples: p.data.examples });
+      const body = { name: p.data.name, description: out.evaluator.description, kind: "jev" as const, target: out.evaluator.target, filter: p.data.filter ?? null, questions: out.evaluator.questions, composite: out.evaluator.composite };
+      let saved = null;
+      if (p.data.save && !hasErrors(out.lint)) saved = repo.upsertEvaluator(body);
+      return c.json({ evaluator: body, notes: out.evaluator.notes, lint: out.lint, ok: !hasErrors(out.lint), saved, model: out.model, attempts: out.attempts, costUsd: out.costUsd }, saved ? 201 : 200);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 502);
+    }
+  });
+
   app.get("/api/v1/evaluators/:id", (c) => {
     const e = repo.getEvaluator(c.req.param("id")) ?? repo.getEvaluatorByName(c.req.param("id"));
-    return e ? c.json(e) : c.json({ error: "not found" }, 404);
+    return e ? c.json({ ...e, lint: lintOf(e) }) : c.json({ error: "not found" }, 404);
+  });
+  app.get("/api/v1/evaluators/:id/lint", (c) => {
+    const e = repo.getEvaluator(c.req.param("id")) ?? repo.getEvaluatorByName(c.req.param("id"));
+    if (!e) return c.json({ error: "not found" }, 404);
+    const findings = lintOf(e);
+    return c.json({ ok: !hasErrors(findings), findings });
+  });
+  /**
+   * Backtest: run this evaluator (force, bypassing the cache) on the most recent human-labeled traces and report,
+   * per question, how well its answers separate human pass from human fail. ?limit=<n> labeled traces (default 30).
+   */
+  app.post("/api/v1/evaluators/:id/backtest", async (c) => {
+    const e = repo.getEvaluator(c.req.param("id")) ?? repo.getEvaluatorByName(c.req.param("id"));
+    if (!e) return c.json({ error: "not found" }, 404);
+    if (e.kind !== "jev") return c.json({ error: "backtest applies to jev evaluators" }, 400);
+    if (!judge) return c.json({ error: "no judge configured (TYPESAFE_API_KEY)" }, 503);
+    const ids = repo.annotatedTraceIds(Number(c.req.query("limit") ?? 30));
+    if (!ids.length) return c.json({ error: "no human-labeled traces yet; leave pass/fail verdicts on a few traces first" }, 409);
+    const results: Record<string, string> = {};
+    let cost = 0;
+    for (const id of ids) {
+      const out = await evaluateTrace(repo, judges, e, id, { force: true });
+      results[id] = out.status;
+      cost += out.costUsd ?? 0;
+    }
+    const diagnostics = questionDiagnostics(repo.questionScoreRows({ evaluator: e.name, traceIds: ids }), { minLabeled: 4 });
+    return c.json({ evaluator: e.name, traces: ids.length, results, costUsd: cost, diagnostics });
   });
   app.post("/api/v1/evaluators", async (c) => {
     const p = evaluatorBody.safeParse(await c.req.json());
@@ -151,8 +249,11 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
     const questions = kind === "code" ? { checks: p.data.checks ?? [] } : (p.data.questions ?? {});
     if (kind === "code" && !p.data.checks?.length) return c.json({ error: "code evaluators need a non-empty `checks` array" }, 400);
     if (kind === "jev" && !Object.keys(questions).length) return c.json({ error: "jev evaluators need at least one question" }, 400);
+    const findings = lintEvaluator({ kind, target: p.data.target ?? "trace", filter: p.data.filter ?? null, questions, composite: p.data.composite ?? null });
+    // errors are real breakage (unknown question in composite, wrong transform, ...); ?force=1 saves anyway
+    if (hasErrors(findings) && c.req.query("force") !== "1") return c.json({ error: "evaluator failed lint; fix the errors or pass ?force=1", lint: findings }, 422);
     const { checks: _c, ...rest } = p.data;
-    return c.json(repo.upsertEvaluator({ ...rest, kind, questions, filter: p.data.filter ?? null, composite: p.data.composite ?? null }), 201);
+    return c.json({ ...repo.upsertEvaluator({ ...rest, kind, questions, filter: p.data.filter ?? null, composite: p.data.composite ?? null }), lint: findings }, 201);
   });
   app.patch("/api/v1/evaluators/:id", async (c) => {
     const e = repo.getEvaluator(c.req.param("id")) ?? repo.getEvaluatorByName(c.req.param("id"));
@@ -223,6 +324,8 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
 
   /** Grader calibration: agreement between EVAL scores and human ANNOTATION scores of the same name on the same trace. */
   app.get("/api/v1/calibration", (c) => c.json({ data: calibration(repo.calibrationPairs()) }));
+  /** Per-question diagnostics: undecided/low-confidence rates, constancy, separation vs the human verdict, and what to rewrite. ?evaluator=<name> */
+  app.get("/api/v1/calibration/questions", (c) => c.json({ data: questionDiagnostics(repo.questionScoreRows({ evaluator: c.req.query("evaluator") || undefined })) }));
 
   /** Traces worth a human look: low confidence, failed, grader errors. */
   app.get("/api/v1/review", (c) => c.json({ data: repo.reviewQueue(Number(c.req.query("limit") ?? 100)) }));

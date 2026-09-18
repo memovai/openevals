@@ -74,6 +74,8 @@ describe("observation-level evaluators", () => {
     expect(state.context.parent).toBe("root");
     expect(state.context.position).toBe("step 2 of 2");
     expect(state.context.previous_steps).toEqual([{ i: 0, type: "AGENT", name: "root" }]);
+    expect(state.context.previous_steps_omitted).toBe(0);
+    expect(state.context.last_error).toBeNull();
     expect(meta.truncated).toBe(true);
     expect(JSON.stringify(state).length).toBeLessThanOrEqual(10_000);
   });
@@ -88,8 +90,10 @@ describe("observation-level evaluators", () => {
     await worker!.tick();
     expect(judge.calls).toBe(2); // two TOOL observations, not the GENERATION
     const scores = repo.listScores("t1").filter((s) => s.source === "EVAL");
-    expect(new Set(scores.map((s) => s.observation_id))).toEqual(new Set(["s1", "s2"]));
+    expect(new Set(scores.filter((s) => s.observation_id).map((s) => s.observation_id))).toEqual(new Set(["s1", "s2"]));
     expect(scores.filter((s) => s.name === "tool_call_quality")).toHaveLength(2);
+    // trace-level roll-up of the per-step composite
+    expect(scores.find((s) => s.name === "tool_call_quality_mean" && s.observation_id === null)).toBeDefined();
     const jd = repo.listJudgments("t1");
     expect(jd.map((j) => j.observation_id).sort()).toEqual(["s1", "s2"]);
     // re-run: cached per observation
@@ -159,6 +163,7 @@ describe("escalation", () => {
     const judge = fakeJudge(0.3);
     const esc = fakeEscalator();
     const { app, repo, worker } = createApp({ dbPath: ":memory:", judge, escalator: esc, quiet: true });
+    repo.setEvaluatorEnabled(repo.getEvaluatorByName("step")!.id, false);
     await post(app, "/api/public/ingestion", batch);
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01'");
     await worker!.tick();
@@ -191,13 +196,14 @@ describe("escalation", () => {
     await post(app, "/api/public/ingestion", batch);
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01'");
     await worker!.tick();
-    expect(esc.calls).toBe(1);
+    expect(esc.calls).toBe(4); // trajectory + 3 steps (2 tools + 1 generation), each with an undecided noul
   });
 
   it("manual escalation endpoint", async () => {
     const judge = fakeJudge(0.95);
     const esc = fakeEscalator();
     const { app, repo } = createApp({ dbPath: ":memory:", judge, escalator: esc, quiet: true });
+    repo.setEvaluatorEnabled(repo.getEvaluatorByName("step")!.id, false);
     await post(app, "/api/public/ingestion", batch);
     await evaluateAll(app, "t1");
     expect(esc.calls).toBe(0);

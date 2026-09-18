@@ -33,5 +33,17 @@ export const config = {
   workerTickMs: 1000,
   workerBatch: 8,
   maxAttempts: 5,
+
+  // Per-step (observation-level) grading. jev is ~100 ms per request, so steps of one trace
+  // are judged concurrently; very long runs are sampled down to `stepMaxPerTrace` steps.
+  stepConcurrency: num(process.env.OPENEVALS_STEP_CONCURRENCY, 8),
+  stepMaxPerTrace: num(process.env.OPENEVALS_STEP_MAX, 150),
+  /** how many previous steps a per-step state carries (with clipped input/output) */
+  stepContextWindow: num(process.env.OPENEVALS_STEP_CONTEXT, 8),
+  /** trace-level jev evaluators wait for per-step ones so their answers can be folded into the state */
+  stepWaitMs: num(process.env.OPENEVALS_STEP_WAIT_MS, 2000),
+
+  // Rubric compiler (natural language → jev questions). Needs ANTHROPIC_API_KEY.
+  compileModel: process.env.OPENEVALS_COMPILE_MODEL ?? process.env.OPENEVALS_ESCALATE_MODEL ?? "claude-sonnet-5",
 };
 export type Config = typeof config;

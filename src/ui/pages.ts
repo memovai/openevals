@@ -5,6 +5,10 @@ import { Hono } from "hono";
 import { html, raw } from "hono/html";
 import type { Repo, ScoreRow, ObservationRow, JudgmentRow, TraceRow } from "../db/repo.js";
 import { runReport, calibration } from "../eval/metrics.js";
+import { questionDiagnostics } from "../eval/diagnostics.js";
+import { lintEvaluator } from "../eval/lint.js";
+import { templates } from "../eval/templates.js";
+import { summarizeSteps } from "../eval/steps.js";
 
 const esc = (s: unknown): string =>
   String(s ?? "")
@@ -51,6 +55,8 @@ details summary{cursor:pointer;color:var(--muted)}
 .lvl-ERROR{color:var(--bad);font-weight:600}.lvl-WARNING{color:var(--warn)}
 .bar{display:flex;align-items:center;gap:8px;margin:2px 0}.bar .lbl{min-width:220px;font-size:12px}.bar .trk{flex:1;height:10px;background:var(--bar);border-radius:5px;overflow:hidden}.bar .fill{height:100%;background:var(--accent)}.bar .val{min-width:44px;text-align:right;font-size:12px}
 .q{padding:8px 0;border-bottom:1px dashed var(--line)}.q:last-child{border-bottom:0}.q .qh{display:flex;justify-content:space-between;gap:10px}.q .qh b{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.strip{display:flex;gap:2px;flex-wrap:wrap;margin:6px 0}.strip a{display:block;width:14px;height:14px;border-radius:3px;background:var(--line)}.strip a.p2{background:var(--ok)}.strip a.p1{background:var(--warn)}.strip a.p0{background:var(--bad)}.strip a.off{outline:2px solid var(--bad);outline-offset:-2px}
+.lint{margin:6px 0 0;padding-left:18px;font-size:12px}.lint li{margin:2px 0}.lint .error{color:var(--bad)}.lint .warn{color:var(--warn)}.lint .info{color:var(--muted)}
 form.inline{display:inline}button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}button:hover{border-color:var(--accent)}
 `;
 
@@ -113,10 +119,30 @@ function obsTree(obs: ObservationRow[], scores: ScoreRow[] = []) {
         const sc = (scoresByObs.get(o.id) ?? [])
           .map((s) => `<span class="badge${s.data_type === "BOOLEAN" ? (s.value ? " ok" : " bad") : ""}" title="${esc(s.comment ?? "")}">${esc(s.name)} ${s.string_value ?? (s.value != null ? s.value.toFixed(2) : "")}</span>`)
           .join("");
-        return `<div class="step" style="margin-left:${depth(o) * 18}px"><div class="hd"><span class="type ${esc(o.type)}">${esc(o.type)}</span><b>${esc(o.name ?? "")}</b>${o.model ? `<span class="muted mono">${esc(o.model)}</span>` : ""}<span class="muted">${fmtMs(dur)}</span>${usage}${o.level !== "DEFAULT" ? `<span class="lvl-${esc(o.level)}">${esc(o.level)}${o.status_message ? ": " + esc(o.status_message) : ""}</span>` : ""}</div>${sc ? `<div>${sc}</div>` : ""}${io}</div>`;
+        return `<div class="step" id="obs-${esc(o.id)}" style="margin-left:${depth(o) * 18}px"><div class="hd"><span class="type ${esc(o.type)}">${esc(o.type)}</span><b>${esc(o.name ?? "")}</b>${o.model ? `<span class="muted mono">${esc(o.model)}</span>` : ""}<span class="muted">${fmtMs(dur)}</span>${usage}${o.level !== "DEFAULT" ? `<span class="lvl-${esc(o.level)}">${esc(o.level)}${o.status_message ? ": " + esc(o.status_message) : ""}</span>` : ""}</div>${sc ? `<div>${sc}</div>` : ""}${io}</div>`;
       })
       .join(""),
   );
+}
+
+/** One square per step coloured by the per-step `progress` answer (green progress · amber none · red regressed); off-task steps outlined. */
+function progressStrip(obs: ObservationRow[], scores: ScoreRow[]) {
+  const byObs = new Map<string, Map<string, ScoreRow>>();
+  for (const s of scores) if (s.source === "EVAL" && s.observation_id) byObs.set(s.observation_id, new Map([...(byObs.get(s.observation_id) ?? new Map()), [s.name, s]]));
+  if (![...byObs.values()].some((m) => m.has("progress"))) return raw("");
+  const sum = summarizeSteps(obs, scores);
+  const cells = obs
+    .map((o, i) => {
+      const m = byObs.get(o.id);
+      const p = m?.get("progress");
+      const cls = p?.value == null ? "" : `p${Math.round(p.value)}`;
+      const off = (m?.get("on_task")?.value ?? 1) < 0.5 ? " off" : "";
+      const title = `#${i} ${o.name ?? o.type}${p?.value != null ? ` · progress ${p.value.toFixed(1)}` : ""}${off ? " · off task" : ""}`;
+      return `<a class="${cls}${off}" href="#obs-${esc(o.id)}" title="${esc(title)}"></a>`;
+    })
+    .join("");
+  const f = (v: number | null) => (v == null ? "–" : Number.isInteger(v) ? String(v) : v.toFixed(2));
+  return raw(`<div class="strip">${cells}</div><div class="muted" style="font-size:12px;margin-bottom:8px">per-step: progress ${f(sum.progress_mean)} · wasted ${f(sum.wasted_fraction)} · longest stall ${f(sum.longest_stall)} · first off-task ${sum.first_off_task_step == null ? "none" : "#" + sum.first_off_task_step}${sum.errors ? ` · recovered ${sum.errors_recovered ?? 0}/${sum.errors} errors` : ""}</div>`);
 }
 
 function judgmentView(jd: JudgmentRow, evName: string, obsName?: string | null) {
@@ -229,7 +255,7 @@ export function uiRoutes(repo: Repo): Hono {
             </form></div>
           ${raw([...latest.values()].map((jd) => judgmentView(jd, evNames.get(jd.evaluator_id) ?? jd.evaluator_id, jd.observation_id ? obsNames.get(jd.observation_id) ?? jd.observation_id : null)).join(""))}
         </div>
-        <div><div class="card"><h2>Trajectory</h2>${obsTree(obs, scores)}</div>
+        <div><div class="card"><h2>Trajectory</h2>${progressStrip(obs, scores)}${obsTree(obs, scores)}</div>
           ${t.metadata ? raw(`<div class="card"><h2>Metadata</h2><pre class="mono">${esc(pretty(t.metadata))}</pre></div>`) : ""}</div>
       </div>`;
     return c.html(layout(t.name ?? "trace", body, stats()));
@@ -238,16 +264,28 @@ export function uiRoutes(repo: Repo): Hono {
   app.get("/evaluators", (c) => {
     const evs = repo.listEvaluators();
     const cards = evs
-      .map(
-        (e) => `<div class="card"><h2>${esc(e.name)} <span class="muted">v${e.version}${e.builtin ? " · builtin" : ""} · ${e.kind === "code" ? "code grader" : "jev"} · ${e.target === "observation" ? "per observation" : "per trace"} · ${e.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge bad">disabled</span>'}</span>
+      .map((e) => {
+        const lint = lintEvaluator({ kind: e.kind, target: e.target, filter: e.filter, questions: e.questions, composite: e.composite });
+        const lintHtml = lint.length
+          ? `<details><summary>lint: ${lint.filter((x) => x.level === "error").length} errors · ${lint.filter((x) => x.level === "warn").length} warnings · ${lint.filter((x) => x.level === "info").length} notes</summary><ul class="lint">${lint.map((x) => `<li class="${x.level}"><b>${esc(x.level)}</b> ${x.question ? `<span class="mono">${esc(x.question)}</span> ` : ""}${esc(x.message)}${x.fix ? ` <span class="muted">→ ${esc(x.fix)}</span>` : ""}</li>`).join("")}</ul></details>`
+          : `<p class="muted" style="font-size:12px;margin:6px 0 0">lint: clean</p>`;
+        return `<div class="card"><h2>${esc(e.name)} <span class="muted">v${e.version}${e.builtin ? " · builtin" : ""} · ${e.kind === "code" ? "code grader" : "jev"} · ${e.target === "observation" ? "per step" : "per trace"} · ${e.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge bad">disabled</span>'}</span>
           <form class="inline" method="post" action="/evaluators/${esc(e.id)}/toggle"><button>${e.enabled ? "disable" : "enable"}</button></form></h2>
           <p>${esc(e.description ?? "")}</p>
           ${e.filter ? `<p class="muted mono">filter: ${esc(JSON.stringify(e.filter))}</p>` : ""}
           <details><summary>${e.kind === "code" ? `${((e.questions as { checks?: unknown[] }).checks ?? []).length} checks` : `${Object.keys(e.questions).length} questions`}</summary><pre class="mono">${esc(pretty(e.questions))}</pre></details>
-          ${e.composite ? `<details><summary>composite</summary><pre class="mono">${esc(pretty(e.composite))}</pre></details>` : ""}</div>`,
-      )
+          ${e.composite ? `<details><summary>composite</summary><pre class="mono">${esc(pretty(e.composite))}</pre></details>` : ""}
+          ${lintHtml}</div>`;
+      })
       .join("");
-    const body = html`<h1>Evaluators</h1><p class="muted">Each evaluator is one jev request per trace: every question below is asked in parallel against the same compacted trajectory. Create custom ones via <code>POST /api/v1/evaluators</code>.</p>${raw(cards)}`;
+    const tpl = templates
+      .map((t) => `<tr><td class="mono">${esc(t.id)}</td><td><b>${esc(t.title)}</b><br><span class="muted">${esc(t.description)}</span></td><td class="mono muted">${Object.keys(t.questions).join(", ")}</td></tr>`)
+      .join("");
+    const body = html`<h1>Evaluators</h1>
+      <p class="muted">A jev evaluator is a set of atomic typed questions asked in <b>one request per trace</b> (or per step); weights and pass rules live in <code>composite</code>. Per-step evaluators run concurrently across the steps of a trace and their answers are folded into the trace-level state. Lint flags the ways a rubric written for a text-generating judge fails on jev. See <code>docs/designing-for-jev.md</code>.</p>
+      ${raw(cards)}
+      <div class="card"><h2>Templates</h2><p class="muted">Starter rubrics already decomposed for jev. Copy one: <code>POST /api/v1/evaluators/from-template {"template":"coding-agent","name":"my-coder","filter":{"names":["my-agent"]}}</code>. Or compile your own rubric from prose: <code>POST /api/v1/evaluators/compile {"name","rubric","save":true}</code> (needs ANTHROPIC_API_KEY).</p>
+        <table><thead><tr><th>Template</th><th>For</th><th>Questions</th></tr></thead><tbody>${raw(tpl)}</tbody></table></div>`;
     return c.html(layout("Evaluators", body, stats()));
   });
 
@@ -294,8 +332,20 @@ export function uiRoutes(repo: Repo): Hono {
           `<tr><td class="mono">${esc(r.name)}</td><td class="right">${r.n}</td><td class="right">${r.agreement == null ? "–" : (r.agreement * 100).toFixed(0) + "%"}</td><td class="right">${f(r.kappa)}</td><td class="right">${f(r.mae)}</td><td class="right">${f(r.pearson_r)}</td><td class="right ${r.false_pass ? "lvl-ERROR" : ""}">${r.false_pass}</td><td class="right">${r.false_fail}</td></tr>`,
       )
       .join("");
+    const diags = questionDiagnostics(repo.questionScoreRows());
+    const pct = (v: number | null) => (v == null ? "–" : (v * 100).toFixed(0) + "%");
+    const dr = diags
+      .map((d) => {
+        const issues = d.issues.map((i) => `<li class="${i.level}">${esc(i.message)}</li>`).join("");
+        const sep = d.auc == null ? "–" : `${d.auc.toFixed(2)} <span class="muted">${d.direction === "higher_is_pass" ? "↑ pass" : d.direction === "higher_is_fail" ? "↑ fail" : "none"}</span>`;
+        return `<tr><td class="mono"><span class="muted">${esc(d.evaluator)}</span><br>${esc(d.question)}</td><td class="muted">${esc(d.kind)}</td><td class="right">${d.n}<br><span class="muted">${d.n_labeled} labeled</span></td><td class="right">${d.kind === "choice" ? `${esc(d.mode ?? "")} ${pct(d.mode_rate)}` : d.mean == null ? "–" : d.mean.toFixed(2)}</td><td class="right">${pct(d.undecided_rate ?? d.low_confidence_rate)}</td><td class="right">${sep}</td><td class="right ${d.false_pass ? "lvl-ERROR" : ""}">${d.false_pass ?? "–"}</td><td>${issues ? `<ul class="lint" style="margin:0">${issues}</ul>` : '<span class="badge ok">ok</span>'}</td></tr>`;
+      })
+      .join("");
     const body = html`<h1>Grader calibration</h1><p class="muted">For every score that has both a model (EVAL) and a human (ANNOTATION) value on the same trace. Annotate from the trace page or <code>POST /api/v1/scores</code> with the same score name. <b>false pass</b> = grader said pass, human said fail — the direction that hides real failures.</p>
-      <table><thead><tr><th>Score</th><th class="right">n</th><th class="right">Agreement</th><th class="right">κ</th><th class="right">MAE</th><th class="right">Pearson r</th><th class="right">False pass</th><th class="right">False fail</th></tr></thead><tbody>${raw(tr || '<tr><td colspan="8" class="muted">no human annotations yet</td></tr>')}</tbody></table>`;
+      <table><thead><tr><th>Score</th><th class="right">n</th><th class="right">Agreement</th><th class="right">κ</th><th class="right">MAE</th><th class="right">Pearson r</th><th class="right">False pass</th><th class="right">False fail</th></tr></thead><tbody>${raw(tr || '<tr><td colspan="8" class="muted">no human annotations yet</td></tr>')}</tbody></table>
+      <h2 style="margin-top:24px">Per question: what to rewrite</h2>
+      <p class="muted">Every jev question on its own. <b>Unsure</b> = undecided nouls (P(yes) near 0.5) or low-confidence score/choice answers → the criteria are vague. <b>Separation</b> = AUC of the answer against the human verdict (0.5 = no signal) → the question does not track what reviewers check. Questions with the most issues first. Same data as <code>GET /api/v1/calibration/questions</code>; run <code>POST /api/v1/evaluators/:id/backtest</code> after editing a rubric to re-measure on the labeled traces.</p>
+      <table><thead><tr><th>Question</th><th>Type</th><th class="right">n</th><th class="right">Mean / mode</th><th class="right">Unsure</th><th class="right">Separation</th><th class="right">False pass</th><th>Diagnosis</th></tr></thead><tbody>${raw(dr || '<tr><td colspan="8" class="muted">no jev judgments yet</td></tr>')}</tbody></table>`;
     return c.html(layout("Calibration", body, stats()));
   });
 

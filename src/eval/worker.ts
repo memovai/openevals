@@ -5,8 +5,9 @@
 // identical data never costs a second call. Low-confidence judgments are
 // escalated to a reasoning model when one is configured.
 import { config } from "../config.js";
-import type { Repo, EvaluatorRow, TraceRow, ObservationRow, JudgmentRow } from "../db/repo.js";
+import type { Repo, EvaluatorRow, TraceRow, ObservationRow, JudgmentRow, QueueRow } from "../db/repo.js";
 import { buildTraceState, buildObservationState, hashState, type StateMeta } from "./state.js";
+import { mapLimit, sampleEvenly, stepJudgmentsFromScores, summarizeSteps, summaryForState, summaryScores } from "./steps.js";
 import { answersToScores, hasUndecidedNoul, minConfidence, type CompositeSpec } from "./aggregate.js";
 import { costUsd, type Judge } from "./jev.js";
 import type { Escalator } from "./escalate.js";
@@ -60,6 +61,8 @@ export interface EvalOutcome {
   escalated?: boolean;
   /** observation-level: per-observation outcomes */
   items?: Record<string, EvalOutcome>;
+  /** observation-level: the run was longer than OPENEVALS_STEP_MAX, so steps were sampled */
+  sampled?: { judged: number; of: number };
 }
 
 export interface Judges {
@@ -193,7 +196,9 @@ export async function escalateJudgment(repo: Repo, escalator: Escalator, ev: Eva
 }
 
 async function judgeUnit(repo: Repo, judges: Judges, ev: EvaluatorRow, unit: Unit, opts: { force?: boolean }): Promise<EvalOutcome> {
-  const stateHash = hashState({ state: unit.state, questions: unit.questions, observationId: unit.observationId });
+  // The per-step state already carries the step's position, so the observation id is not part of the key:
+  // identical steps of identical runs (re-runs, duplicate imports) reuse each other's judgments.
+  const stateHash = hashState({ state: unit.state, questions: unit.questions });
   if (!opts.force) {
     const cached = repo.findJudgmentByHash(ev.id, ev.version, stateHash);
     if (cached) return reuseCached(repo, cached, unit, ev);
@@ -329,27 +334,78 @@ export async function evaluateTrace(repo: Repo, judges: Judges | Judge, ev: Eval
   if (!Object.keys(questions).length) return { status: "skipped", reason: "no applicable questions" };
 
   if (ev.target === "observation") {
-    const targets = observations.filter((o) => observationMatches(ev, o));
-    if (!targets.length) return { status: "skipped", reason: "no matching observations" };
+    const all = observations.filter((o) => observationMatches(ev, o));
+    if (!all.length) return { status: "skipped", reason: "no matching observations" };
+    // jev is ~100 ms per request, so the steps of one trace are judged concurrently. Very long
+    // runs are sampled evenly (first and last step always included) to bound cost.
+    const targets = sampleEvenly(all, config.stepMaxPerTrace);
     const items: Record<string, EvalOutcome> = {};
+    const outcomes = await mapLimit(targets, config.stepConcurrency, async (o) => {
+      const { state, meta } = buildObservationState(trace, observations, o, config.stateBudgetChars, config.stepContextWindow);
+      return judgeUnit(repo, J, ev, { trace, observationId: o.id, state, meta, questions }, opts);
+    });
     let cost = 0,
       judged = 0,
       errors = 0;
-    for (const o of targets) {
-      const { state, meta } = buildObservationState(trace, observations, o, config.stateBudgetChars);
-      const r = await judgeUnit(repo, J, ev, { trace, observationId: o.id, state, meta, questions }, opts);
+    targets.forEach((o, i) => {
+      const r = outcomes[i]!;
       items[o.id] = r;
       cost += r.costUsd ?? 0;
       if (r.status === "judged") judged++;
       if (r.status === "error") errors++;
-    }
+    });
     if (errors && errors === targets.length) return { status: "error", reason: `all ${errors} observations failed`, items };
-    return { status: judged ? "judged" : "cached", costUsd: cost, items };
+    writeStepSummary(repo, ev, trace, observations);
+    return { status: judged ? "judged" : "cached", costUsd: cost, items, sampled: targets.length < all.length ? { judged: targets.length, of: all.length } : undefined };
   }
 
   if (!observations.length && (trace.output === null || trace.output === undefined)) return { status: "skipped", reason: "empty trace" };
-  const { state, meta } = buildTraceState(trace, observations, config.stateBudgetChars);
+  const { state, meta } = buildTraceState(trace, observations, config.stateBudgetChars, stepContext(repo, trace, observations));
   return judgeUnit(repo, J, ev, { trace, observationId: null, state, meta, questions }, opts);
+}
+
+/** Per-step answers already on this trace (from observation-level evaluators), ready to fold into a trace-level state. */
+export function stepContext(repo: Repo, trace: TraceRow, observations: ObservationRow[]) {
+  const stepScores = repo.listScores(trace.id).filter((s) => s.source === "EVAL" && s.observation_id !== null);
+  if (!stepScores.length) return {};
+  return { stepJudgments: stepJudgmentsFromScores(stepScores), stepSummary: summaryForState(summarizeSteps(observations, stepScores)) };
+}
+
+/** Roll the per-step scores of `ev` up into trace-level metrics (credit assignment; free). */
+function writeStepSummary(repo: Repo, ev: EvaluatorRow, trace: TraceRow, observations: ObservationRow[]): void {
+  const mine = repo.listScores(trace.id).filter((s) => s.source === "EVAL" && s.evaluator_id === ev.id && s.observation_id !== null);
+  const summary = summarizeSteps(observations, mine);
+  const rows = summaryScores(summary);
+  const judgmentId = mine.find((s) => s.judgment_id)?.judgment_id ?? null;
+  repo.db.exec("BEGIN");
+  try {
+    repo.deleteTraceLevelEvalScores(trace.id, ev.id);
+    for (const r of rows) {
+      repo.insertScore({
+        trace_id: trace.id,
+        observation_id: null,
+        source: "EVAL",
+        evaluator_id: ev.id,
+        judgment_id: judgmentId,
+        name: r.name,
+        value: r.value,
+        string_value: null,
+        data_type: "NUMERIC",
+        comment: r.comment,
+        metadata: { model: "code", kind: "aggregate", from: ev.name },
+      });
+    }
+    repo.db.exec("COMMIT");
+  } catch (e) {
+    repo.db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+/** Code graders first (free), then per-step graders, then trace-level graders that fold the step answers in. */
+export function orderEvaluators<T extends { kind: string; target: string }>(evs: T[]): T[] {
+  const rank = (e: T) => (e.kind === "code" ? 0 : e.target === "observation" ? 1 : 2);
+  return [...evs].sort((a, b) => rank(a) - rank(b));
 }
 
 export class EvalWorker {
@@ -371,29 +427,53 @@ export class EvalWorker {
     this.timer = null;
   }
 
+  /** Trace-level graders wait (bounded) for per-step graders so the step answers can be folded into their state. */
+  private shouldWaitForSteps(traceId: string): boolean {
+    const pending = this.repo.pendingObservationEvals(traceId);
+    if (!pending.length) return false;
+    // give up waiting on a row that has not moved for two minutes (stuck worker, endless retries)
+    const fresh = pending.some((p) => Date.now() - Date.parse(p.updated_at) < 120_000);
+    return fresh;
+  }
+
   async tick(): Promise<number> {
     if (this.busy) return 0;
     this.busy = true;
     let processed = 0;
     try {
       const due = this.repo.claimDue(config.workerBatch);
+      // Rows of one trace run in order (code → per-step → trace-level) so the trace-level grader
+      // sees the step answers; different traces run concurrently.
+      const byTrace = new Map<string, QueueRow[]>();
+      for (const row of due) byTrace.set(row.trace_id, [...(byTrace.get(row.trace_id) ?? []), row]);
       await Promise.all(
-        due.map(async (row) => {
-          const ev = this.repo.getEvaluator(row.evaluator_id);
-          if (!ev || !ev.enabled) {
-            this.repo.finishQueue(row.trace_id, row.evaluator_id, "skipped");
-            return;
-          }
-          const out = await evaluateTrace(this.repo, this.judges, ev, row.trace_id);
-          processed++;
-          if (out.status === "error") {
-            const attempts = row.attempts + 1;
-            const retryAt = attempts < config.maxAttempts ? new Date(Date.now() + Math.min(60_000, 2 ** attempts * 1000)).toISOString() : null;
-            this.repo.failQueue(row.trace_id, row.evaluator_id, out.reason ?? "error", retryAt);
-            this.log.warn(`[eval] ${ev.name} trace=${row.trace_id} failed (attempt ${attempts}): ${out.reason}`);
-          } else {
-            this.repo.finishQueue(row.trace_id, row.evaluator_id, out.status === "skipped" ? "skipped" : "done");
-            if (out.status === "judged") this.log.info(`[eval] ${ev.name} trace=${row.trace_id} judged${out.escalated ? " (escalated)" : ""} $${out.costUsd?.toFixed(6)}`);
+        [...byTrace.values()].map(async (rows) => {
+          const withEv = rows.map((row) => ({ row, ev: this.repo.getEvaluator(row.evaluator_id) }));
+          for (const { row, ev } of withEv.filter((x) => !x.ev)) this.repo.finishQueue(row.trace_id, row.evaluator_id, "skipped");
+          const ordered = orderEvaluators(withEv.filter((x): x is { row: QueueRow; ev: EvaluatorRow } => !!x.ev).map((x) => ({ ...x, kind: x.ev.kind, target: x.ev.target })));
+          for (const { row, ev } of ordered) {
+            if (!ev.enabled) {
+              this.repo.finishQueue(row.trace_id, row.evaluator_id, "skipped");
+              continue;
+            }
+            if (ev.kind === "jev" && ev.target === "trace" && this.shouldWaitForSteps(row.trace_id)) {
+              this.repo.deferQueue(row.trace_id, row.evaluator_id, new Date(Date.now() + config.stepWaitMs).toISOString());
+              continue;
+            }
+            const out = await evaluateTrace(this.repo, this.judges, ev, row.trace_id);
+            processed++;
+            if (out.status === "error") {
+              const attempts = row.attempts + 1;
+              const retryAt = attempts < config.maxAttempts ? new Date(Date.now() + Math.min(60_000, 2 ** attempts * 1000)).toISOString() : null;
+              this.repo.failQueue(row.trace_id, row.evaluator_id, out.reason ?? "error", retryAt);
+              this.log.warn(`[eval] ${ev.name} trace=${row.trace_id} failed (attempt ${attempts}): ${out.reason}`);
+            } else {
+              this.repo.finishQueue(row.trace_id, row.evaluator_id, out.status === "skipped" ? "skipped" : "done");
+              if (out.status === "judged") {
+                const steps = out.items ? ` ${Object.keys(out.items).length} steps` : "";
+                this.log.info(`[eval] ${ev.name} trace=${row.trace_id} judged${steps}${out.escalated ? " (escalated)" : ""} $${out.costUsd?.toFixed(6)}`);
+              }
+            }
           }
         }),
       );

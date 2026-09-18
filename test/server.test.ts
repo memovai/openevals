@@ -63,7 +63,7 @@ describe("ingestion + eval", () => {
     expect(obs.find((o) => o.name === "answer")!.usage_total).toBe(15);
     expect(repo.listScores("t1").map((s) => s.name)).toEqual(["thumbs"]);
     // queued for every enabled evaluator
-    expect(repo.queueStats().pending).toBe(3); // sanity, trajectory, outcome
+    expect(repo.queueStats().pending).toBe(4); // sanity, step, trajectory, outcome
   });
 
   it("worker judges via jev, writes scores, caches by state hash", async () => {
@@ -73,29 +73,39 @@ describe("ingestion + eval", () => {
     // make the queue due now
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
     const n = await worker!.tick();
-    expect(n).toBe(3);
-    expect(judge.calls).toBe(1); // `outcome` skipped: no expected_output
+    expect(n).toBe(4);
+    // `step` judges the TOOL and the GENERATION (2 calls) before `trajectory` (1 call); `outcome` skipped: no expected_output
+    expect(judge.calls).toBe(3);
     const scores = repo.listScores("t2").filter((s) => s.source === "EVAL");
     const names = scores.map((s) => s.name);
     expect(names).toContain("task_completion");
     expect(names).toContain("trajectory_quality");
     expect(names).toContain("passed");
     expect(names).not.toContain("matches_expected");
+    // per-step answers were folded into the trace-level state
+    const traj = repo.listJudgments("t2").find((j) => j.observation_id === null && j.model !== "code")!;
+    const st = traj.state as { trajectory: { name: string | null; judgments?: Record<string, unknown> }[]; step_summary?: Record<string, unknown> };
+    expect(st.trajectory.find((x) => x.name === "search")?.judgments).toHaveProperty("progress");
+    expect(st.trajectory.find((x) => x.name === "root")?.judgments).toBeUndefined(); // AGENT span is not a graded step
+    expect(st.step_summary).toMatchObject({ steps_judged: 2 });
+    expect(traj.state_meta?.steps_judged).toBe(2);
+    // and rolled up into trace-level aggregate scores
+    expect(scores.find((s) => s.name === "progress_mean")?.metadata?.kind).toBe("aggregate");
     const jd = repo.listJudgments("t2").filter((j) => j.model !== "code");
-    expect(jd).toHaveLength(1);
-    expect(jd[0]!.cost_usd).toBeCloseTo(1234 * 42 / 1e9, 12);
-    expect(repo.queueStats()).toEqual({ done: 2, skipped: 1 });
+    expect(jd).toHaveLength(3);
+    expect(jd.find((j) => j.observation_id === null)!.cost_usd).toBeCloseTo(1234 * 42 / 1e9, 12);
+    expect(repo.queueStats()).toEqual({ done: 3, skipped: 1 });
 
     // re-ingest identical data → re-queued, but cached: no new jev call
     await app.request("/api/public/ingestion", { method: "POST", body: JSON.stringify(batch("t2")), headers: { "content-type": "application/json" } });
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
     await worker!.tick();
-    expect(judge.calls).toBe(1);
+    expect(judge.calls).toBe(3);
 
     // REST surface
     const detail = (await (await app.request("/api/v1/traces/t2")).json()) as { scores: unknown[]; judgments: unknown[]; observations: unknown[] };
     expect(detail.observations).toHaveLength(3);
-    expect(detail.judgments).toHaveLength(2); // jev + sanity (code)
+    expect(detail.judgments).toHaveLength(4); // trajectory + 2 steps + sanity (code)
     const html = await (await app.request("/traces/t2")).text();
     expect(html).toContain("trajectory_quality");
     expect(html).toContain("state sent to jev");
@@ -110,13 +120,13 @@ describe("ingestion + eval", () => {
       repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
       await worker!.tick();
     }
-    expect(judge.calls).toBe(1); // identical trajectories → one jev call
+    expect(judge.calls).toBe(3); // identical trajectories → one jev call per unit (2 steps + trajectory), all reused for dupB
     for (const id of ["dupA", "dupB"]) {
       const s = repo.listScores(id).filter((x) => x.source === "EVAL");
       expect(s.some((x) => x.name === "trajectory_quality")).toBe(true);
       expect(s.some((x) => x.name === "sanity_passed")).toBe(true);
     }
-    const reused = repo.listJudgments("dupB").find((j) => j.model !== "code")!;
+    const reused = repo.listJudgments("dupB").find((j) => j.model !== "code" && j.observation_id === null)!;
     expect(reused.cost_usd).toBe(0);
     expect(reused.state_meta?.cached_from).toBeDefined();
   });
@@ -127,7 +137,7 @@ describe("ingestion + eval", () => {
     await app.request("/api/public/ingestion", { method: "POST", body: JSON.stringify(batch("t3", true)), headers: { "content-type": "application/json" } });
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
     await worker!.tick();
-    expect(judge.calls).toBe(2);
+    expect(judge.calls).toBe(4); // 2 steps + trajectory + outcome
     const names = repo.listScores("t3").map((s) => s.name);
     expect(names).toContain("matches_expected");
     expect(names).toContain("outcome_quality");

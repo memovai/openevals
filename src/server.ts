@@ -10,13 +10,15 @@ import { restRoutes } from "./api/rest.js";
 import { uiRoutes } from "./ui/pages.js";
 import { judgeFromEnv, type Judge } from "./eval/jev.js";
 import { escalatorFromEnv, type Escalator } from "./eval/escalate.js";
-import { EvalWorker, ensureBuiltins, escalateJudgment, evaluateTrace, scheduleTrace, type Judges } from "./eval/worker.js";
+import { compilerFromEnv, type Compiler } from "./eval/compile.js";
+import { EvalWorker, ensureBuiltins, escalateJudgment, evaluateTrace, orderEvaluators, scheduleTrace, type Judges } from "./eval/worker.js";
 import { builtinEvaluators } from "./eval/builtin.js";
 
 export interface AppOptions {
   dbPath?: string;
   judge?: Judge | null;
   escalator?: Escalator | null;
+  compiler?: Compiler | null;
   apiKey?: string;
   evalEnabled?: boolean;
   quiet?: boolean;
@@ -28,6 +30,7 @@ export function createApp(opts: AppOptions = {}) {
   ensureBuiltins(repo, builtinEvaluators);
   const judge = opts.judge === undefined ? judgeFromEnv() : opts.judge;
   const escalator = opts.escalator === undefined ? escalatorFromEnv() : opts.escalator;
+  const compiler = opts.compiler === undefined ? compilerFromEnv() : opts.compiler;
   const judges: Judges = { judge, escalator };
   const evalEnabled = opts.evalEnabled ?? config.evalEnabled;
   const schedule = (traceId: string, settleMs?: number) => {
@@ -54,12 +57,12 @@ export function createApp(opts: AppOptions = {}) {
 
   app.route("/", ingestRoutes(repo, { schedule }));
   app.route("/", otelRoutes(repo, { schedule }));
-  app.route("/", restRoutes(repo, judges, schedule));
+  app.route("/", restRoutes(repo, judges, schedule, { compiler }));
   app.route("/", uiRoutes(repo));
   // form handler lives here because it needs the judge
   app.post("/traces/:id/evaluate", async (c) => {
     const id = c.req.param("id");
-    for (const ev of repo.listEvaluators(true)) await evaluateTrace(repo, judges, ev, id, { force: true });
+    for (const ev of orderEvaluators(repo.listEvaluators(true))) await evaluateTrace(repo, judges, ev, id, { force: true });
     return c.redirect(`/traces/${id}`);
   });
   app.post("/traces/:id/escalate", async (c) => {
@@ -79,17 +82,19 @@ export function createApp(opts: AppOptions = {}) {
   });
 
   const worker = evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? { info() {}, warn() {}, error() {} } : console) : null;
-  return { app, repo, db, judge, escalator, worker };
+  return { app, repo, db, judge, escalator, compiler, worker };
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop()!);
 if (isMain) {
-  const { app, judge, escalator, worker } = createApp();
+  const { app, judge, escalator, compiler, worker } = createApp();
   worker?.start();
   serve({ fetch: app.fetch, port: config.port }, (info) => {
     console.log(`openevals listening on http://localhost:${info.port}  db=${config.dbPath}`);
     if (judge) console.log(`eval: on (model ${judge.model}, settle ${config.settleMs}ms, state budget ${config.stateBudgetChars} chars)`);
     else console.log("eval: code graders only — set TYPESAFE_API_KEY to enable jev judgments");
     if (judge) console.log(escalator ? `escalation: on (${escalator.model} when jev confidence < ${config.reviewConfidence})` : "escalation: off — set ANTHROPIC_API_KEY to get rationales on low-confidence judgments");
+    if (judge) console.log(`per-step grading: on (concurrency ${config.stepConcurrency}, max ${config.stepMaxPerTrace} steps/trace) — disable the \`step\` evaluator to turn it off`);
+    console.log(compiler ? `rubric compiler: on (${compiler.model}) — POST /api/v1/evaluators/compile` : "rubric compiler: off — set ANTHROPIC_API_KEY to compile natural-language rubrics into jev questions");
   });
 }

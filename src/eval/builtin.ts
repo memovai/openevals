@@ -25,7 +25,10 @@ export interface BuiltinEvaluator {
 const STATE_DOC =
   "The state is an agent run: `task` is what the user asked, `trajectory` is the ordered list of steps the agent took " +
   "(LLM generations, tool calls with their inputs and outputs, events; `level` ERROR marks failures), `final_output` is what " +
-  "the agent returned, and `stats` summarises step counts, errors, duration and tokens.";
+  "the agent returned, and `stats` summarises step counts, errors, duration and tokens. Long runs are compacted: a step with " +
+  "`elided: true` keeps only its name, level and `judgments`. `judgments` on a step are answers a fast first-pass grader gave " +
+  "about that step alone (`progress` 0 regressed / 1 none / 2 progress; `on_task`, `redundant`, `corrective` are probabilities); " +
+  "`step_summary`, when present, rolls those up (progress_mean, longest_stall, wasted_fraction, first_off_task_step, error_recovery_rate).";
 
 export const trajectoryEvaluator: BuiltinEvaluator = {
   name: "trajectory",
@@ -161,6 +164,7 @@ export const outcomeEvaluator: BuiltinEvaluator = {
     contradicts_expected: {
       type: "noul",
       instructions: { question: "Does `final_output` contain any statement that directly contradicts `expected_output`?" },
+      criteria: { true: "At least one statement in `final_output` asserts the opposite of something `expected_output` states.", false: "Nothing in `final_output` conflicts with `expected_output`; omissions are not contradictions." },
     },
   },
   composite: {
@@ -177,7 +181,8 @@ export const outcomeEvaluator: BuiltinEvaluator = {
 
 const STEP_DOC =
   "The state is ONE step of an agent run: `task` is what the user asked, `step` is the step under review (a tool call with `step.input` " +
-  "arguments and `step.output` result; `step.level` ERROR marks a failure), and `context` lists the steps that came before it and the run's `final_output`.";
+  "arguments and `step.output` result; `step.level` ERROR marks a failure), and `context` lists the steps that came before it (`context.previous_steps`), " +
+  "the most recent earlier failure (`context.last_error`) and what the run eventually returned (`context.final_output`; use it only to understand the task, not to grade the step by hindsight).";
 
 /** Observation-level evaluator: judges each TOOL call on its own. Disabled by default — one jev request per tool call. */
 export const toolCallEvaluator: BuiltinEvaluator = {
@@ -204,6 +209,7 @@ export const toolCallEvaluator: BuiltinEvaluator = {
     redundant_call: {
       type: "noul",
       instructions: { question: "Is this step a redundant repeat of an earlier step in `context.previous_steps` (same tool, same or trivially different arguments) without a good reason such as a changed input or a retry after a transient error?", context: STEP_DOC },
+      criteria: { true: "An equivalent call appears in `context.previous_steps` and nothing changed that justifies repeating it.", false: "No equivalent earlier call, or the repeat is justified by changed input or an earlier transient failure." },
     },
   },
   composite: {
@@ -212,6 +218,70 @@ export const toolCallEvaluator: BuiltinEvaluator = {
       { q: "arguments_appropriate", weight: 0.4, transform: "noul" },
       { q: "result_usefulness", weight: 0.4, transform: "score_norm" },
       { q: "redundant_call", weight: 0.2, transform: "noul_inverted" },
+    ],
+  },
+};
+
+const STEP_ANY_DOC =
+  "The state is ONE step of an agent run judged on its own: `task` is what the user asked; `step` is the step under review " +
+  "(`step.type` GENERATION is an LLM call, TOOL is a tool call; `step.input` / `step.output` are its arguments and result; `step.level` ERROR marks a failure); " +
+  "`context.previous_steps` are the steps right before it with clipped input/output (what the agent knew at this point), " +
+  "`context.last_error` is the most recent failed step before this one (or null), and `context.final_output` is what the run eventually returned. " +
+  "Judge only this step. Do not use `context.final_output` to decide whether the step was useful; use it only to understand the task.";
+
+/**
+ * Observation-level evaluator that runs on EVERY step (tool calls and LLM generations). Enabled by default:
+ * jev makes per-step grading affordable (~100 ms, a fraction of a cent per run), and the answers are folded into
+ * the trace-level state, so long runs are graded from a complete, compact skeleton instead of a truncated dump.
+ */
+export const stepEvaluator: BuiltinEvaluator = {
+  name: "step",
+  description:
+    "Per-step process grading of every TOOL and GENERATION step: did it make progress, stay on task, repeat earlier work, react to a prior error. Steps of one trace are judged concurrently; answers feed the trace-level state and roll up into progress_mean, longest_stall, wasted_fraction, first_off_task_step and error_recovery_rate.",
+  target: "observation",
+  filter: { observationTypes: ["TOOL", "GENERATION"] },
+  enabledByDefault: true,
+  questions: {
+    progress: {
+      type: "score",
+      instructions: { question: "Compared with the situation after `context.previous_steps`, how did this `step` change the agent's position toward completing `task`?", context: STEP_ANY_DOC },
+      criteria: [
+        "Regressed: the step failed, produced an error, undid earlier work, or moved the agent further from `task` (e.g. wrong target, broken state).",
+        "No progress: the step completed but added nothing the agent did not already have — a repeat, a dead end, a no-op, or an output that was not usable.",
+        "Progress: the step produced new information, a new artifact, or a state change that the agent needed to complete `task`.",
+      ],
+    },
+    on_task: {
+      type: "noul",
+      instructions: { question: "Is this `step` aimed at the task stated in `task`, rather than at something the task did not ask for?", context: STEP_ANY_DOC },
+      criteria: {
+        true: "The step's target (what it reads, calls, writes or reasons about) is part of accomplishing `task`, or is reasonable preparation for it.",
+        false: "The step works on a different problem, a scope the task excluded, or explores something unrelated to `task`.",
+      },
+    },
+    redundant: {
+      type: "noul",
+      instructions: { question: "Does this `step` repeat a step in `context.previous_steps` (same tool or same request with the same or trivially different input) without a reason such as changed inputs or a retry after a transient failure?", context: STEP_ANY_DOC },
+      criteria: {
+        true: "An equivalent step already appears in `context.previous_steps` and nothing that changed since justifies repeating it.",
+        false: "No equivalent earlier step, or the repeat is justified (input changed, the earlier one failed transiently, a fresh read was needed).",
+      },
+    },
+    corrective: {
+      type: "noul",
+      instructions: { question: "Is this `step` a reaction to a problem in an earlier step — a failure in `context.last_error`, an unexpected result, or a mistake the agent made — that tries a different approach?", context: STEP_ANY_DOC },
+      criteria: {
+        true: "An earlier step failed or misfired and this step changes tool, arguments, or plan in response to it.",
+        false: "No earlier problem to react to, or this step just repeats the failing action unchanged.",
+      },
+    },
+  },
+  composite: {
+    name: "step_quality",
+    terms: [
+      { q: "progress", weight: 0.5, transform: "score_norm" },
+      { q: "on_task", weight: 0.3, transform: "noul" },
+      { q: "redundant", weight: 0.2, transform: "noul_inverted" },
     ],
   },
 };
@@ -233,4 +303,4 @@ export const sanityEvaluator: BuiltinEvaluator = {
   composite: { name: "sanity_score", terms: [], passName: "sanity_passed" },
 };
 
-export const builtinEvaluators: BuiltinEvaluator[] = [sanityEvaluator, trajectoryEvaluator, outcomeEvaluator, toolCallEvaluator];
+export const builtinEvaluators: BuiltinEvaluator[] = [sanityEvaluator, stepEvaluator, trajectoryEvaluator, outcomeEvaluator, toolCallEvaluator];
