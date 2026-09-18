@@ -6,9 +6,8 @@ import { Hono, type Context } from "hono";
 import type { Repo } from "../db/repo.js";
 import { decodeOtlp } from "../otel/decode.js";
 import { mapSpan } from "../otel/map.js";
-import { scheduleTrace } from "../eval/worker.js";
 
-export function otelRoutes(repo: Repo, opts: { evalEnabled: boolean }): Hono {
+export function otelRoutes(repo: Repo, opts: { schedule: (traceId: string) => void }): Hono {
   const app = new Hono();
   const handler = async (c: Context) => {
     const ct = c.req.header("content-type");
@@ -49,7 +48,7 @@ export function otelRoutes(repo: Repo, opts: { evalEnabled: boolean }): Hono {
       repo.db.exec("ROLLBACK");
       throw e;
     }
-    if (opts.evalEnabled) for (const t of touched) scheduleTrace(repo, t);
+    for (const t of touched) opts.schedule(t);
     if (isJson) return c.json({ partialSuccess: {} });
     // Empty ExportTraceServiceResponse encodes to zero bytes.
     return c.body(new Uint8Array(0), 200, { "content-type": "application/x-protobuf" });

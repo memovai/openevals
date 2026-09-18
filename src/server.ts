@@ -28,8 +28,11 @@ export function createApp(opts: AppOptions = {}) {
   ensureBuiltins(repo, builtinEvaluators);
   const judge = opts.judge === undefined ? judgeFromEnv() : opts.judge;
   const escalator = opts.escalator === undefined ? escalatorFromEnv() : opts.escalator;
-  const judges: Judges | null = judge ? { judge, escalator } : null;
-  const evalEnabled = (opts.evalEnabled ?? config.evalEnabled) && !!judge;
+  const judges: Judges = { judge, escalator };
+  const evalEnabled = opts.evalEnabled ?? config.evalEnabled;
+  const schedule = (traceId: string, settleMs?: number) => {
+    if (evalEnabled) scheduleTrace(repo, traceId, settleMs, { hasJudge: !!judge });
+  };
 
   const app = new Hono();
   if (!opts.quiet) app.use(logger());
@@ -49,23 +52,22 @@ export function createApp(opts: AppOptions = {}) {
     });
   }
 
-  app.route("/", ingestRoutes(repo, { evalEnabled }));
-  app.route("/", otelRoutes(repo, { evalEnabled }));
-  app.route("/", restRoutes(repo, judges));
+  app.route("/", ingestRoutes(repo, { schedule }));
+  app.route("/", otelRoutes(repo, { schedule }));
+  app.route("/", restRoutes(repo, judges, schedule));
   app.route("/", uiRoutes(repo));
   // form handler lives here because it needs the judge
   app.post("/traces/:id/evaluate", async (c) => {
     const id = c.req.param("id");
-    if (judges) for (const ev of repo.listEvaluators(true)) await evaluateTrace(repo, judges, ev, id, { force: true });
-    else scheduleTrace(repo, id, 0);
+    for (const ev of repo.listEvaluators(true)) await evaluateTrace(repo, judges, ev, id, { force: true });
     return c.redirect(`/traces/${id}`);
   });
   app.post("/traces/:id/escalate", async (c) => {
     const id = c.req.param("id");
-    if (judges?.escalator) {
+    if (judges.escalator) {
       const seen = new Set<string>();
       for (const jd of repo.listJudgments(id)) {
-        if (jd.status !== "ok" || jd.escalated_from) continue;
+        if (jd.status !== "ok" || jd.escalated_from || jd.model === "code") continue;
         const key = `${jd.evaluator_id}:${jd.observation_id ?? ""}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -76,7 +78,7 @@ export function createApp(opts: AppOptions = {}) {
     return c.redirect(`/traces/${id}`);
   });
 
-  const worker = judges && evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? { info() {}, warn() {}, error() {} } : console) : null;
+  const worker = evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? { info() {}, warn() {}, error() {} } : console) : null;
   return { app, repo, db, judge, escalator, worker };
 }
 
@@ -87,7 +89,7 @@ if (isMain) {
   serve({ fetch: app.fetch, port: config.port }, (info) => {
     console.log(`openeva listening on http://localhost:${info.port}  db=${config.dbPath}`);
     if (judge) console.log(`eval: on (model ${judge.model}, settle ${config.settleMs}ms, state budget ${config.stateBudgetChars} chars)`);
-    else console.log("eval: OFF — set TYPESAFE_API_KEY to enable jev judgments; traces are still recorded");
+    else console.log("eval: code graders only — set TYPESAFE_API_KEY to enable jev judgments");
     if (judge) console.log(escalator ? `escalation: on (${escalator.model} when jev confidence < ${config.reviewConfidence})` : "escalation: off — set ANTHROPIC_API_KEY to get rationales on low-confidence judgments");
   });
 }

@@ -63,7 +63,7 @@ describe("ingestion + eval", () => {
     expect(obs.find((o) => o.name === "answer")!.usage_total).toBe(15);
     expect(repo.listScores("t1").map((s) => s.name)).toEqual(["thumbs"]);
     // queued for every enabled evaluator
-    expect(repo.queueStats().pending).toBe(2);
+    expect(repo.queueStats().pending).toBe(3); // sanity, trajectory, outcome
   });
 
   it("worker judges via jev, writes scores, caches by state hash", async () => {
@@ -73,7 +73,7 @@ describe("ingestion + eval", () => {
     // make the queue due now
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
     const n = await worker!.tick();
-    expect(n).toBe(2);
+    expect(n).toBe(3);
     expect(judge.calls).toBe(1); // `outcome` skipped: no expected_output
     const scores = repo.listScores("t2").filter((s) => s.source === "EVAL");
     const names = scores.map((s) => s.name);
@@ -81,10 +81,10 @@ describe("ingestion + eval", () => {
     expect(names).toContain("trajectory_quality");
     expect(names).toContain("passed");
     expect(names).not.toContain("matches_expected");
-    const jd = repo.listJudgments("t2");
+    const jd = repo.listJudgments("t2").filter((j) => j.model !== "code");
     expect(jd).toHaveLength(1);
     expect(jd[0]!.cost_usd).toBeCloseTo(1234 * 42 / 1e9, 12);
-    expect(repo.queueStats()).toEqual({ done: 1, skipped: 1 });
+    expect(repo.queueStats()).toEqual({ done: 2, skipped: 1 });
 
     // re-ingest identical data → re-queued, but cached: no new jev call
     await app.request("/api/public/ingestion", { method: "POST", body: JSON.stringify(batch("t2")), headers: { "content-type": "application/json" } });
@@ -95,10 +95,30 @@ describe("ingestion + eval", () => {
     // REST surface
     const detail = (await (await app.request("/api/v1/traces/t2")).json()) as { scores: unknown[]; judgments: unknown[]; observations: unknown[] };
     expect(detail.observations).toHaveLength(3);
-    expect(detail.judgments).toHaveLength(1);
+    expect(detail.judgments).toHaveLength(2); // jev + sanity (code)
     const html = await (await app.request("/traces/t2")).text();
     expect(html).toContain("trajectory_quality");
     expect(html).toContain("state sent to jev");
+  });
+
+  it("reuses a judgment for an identical trace at zero cost but still scores the new trace", async () => {
+    const judge = fakeJudge();
+    const { app, repo, worker } = createApp({ dbPath: ":memory:", judge, quiet: true });
+    // sequential arrivals (the worker judges a batch concurrently, so simultaneous duplicates both miss the cache)
+    for (const id of ["dupA", "dupB"]) {
+      await app.request("/api/public/ingestion", { method: "POST", body: JSON.stringify(batch(id)), headers: { "content-type": "application/json" } });
+      repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01T00:00:00Z'");
+      await worker!.tick();
+    }
+    expect(judge.calls).toBe(1); // identical trajectories → one jev call
+    for (const id of ["dupA", "dupB"]) {
+      const s = repo.listScores(id).filter((x) => x.source === "EVAL");
+      expect(s.some((x) => x.name === "trajectory_quality")).toBe(true);
+      expect(s.some((x) => x.name === "sanity_passed")).toBe(true);
+    }
+    const reused = repo.listJudgments("dupB").find((j) => j.model !== "code")!;
+    expect(reused.cost_usd).toBe(0);
+    expect(reused.state_meta?.cached_from).toBeDefined();
   });
 
   it("runs the outcome evaluator when expected_output is present", async () => {

@@ -65,12 +65,33 @@ await eva.flush();
 console.log(`sent 2 traces → ${base}`);
 for (const id of ids) console.log(`  ${base}/traces/${id}`);
 
+// Dataset run: two items, two trials each, so the run report can show pass@k vs pass^k.
+const post = (path: string, body: unknown) => fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+await post("/api/v1/datasets", { name: "demo", description: "two tasks × two trials" });
+await post("/api/v1/datasets/demo/items", {
+  items: [
+    { id: "acme-q2", input: "Acme Q2 2026 revenue vs Q1", expectedOutput: "Q2 2026 revenue was $48.2M, up 12% from $43.0M in Q1." },
+    { id: "sfo-jfk", input: "cheapest direct SFO→JFK 2026-10-03 under $400", expectedOutput: "No booking; cheapest direct fare is above $400 or provider unavailable." },
+  ],
+});
+const run = `demo-${new Date().toISOString().slice(11, 19).replace(/:/g, "")}`;
+const trials: string[] = [];
+for (let i = 0; i < 2; i++) {
+  const g = await goodRun();
+  const b = await badRun();
+  await eva.flush();
+  await post(`/api/v1/datasets/demo/runs/${run}/items`, { datasetItemId: "acme-q2", traceId: g });
+  await post(`/api/v1/datasets/demo/runs/${run}/items`, { datasetItemId: "sfo-jfk", traceId: b });
+  trials.push(g, b);
+}
+console.log(`dataset run "${run}": 2 items × 2 trials → ${base}/datasets`);
+
 if (!health.eval) {
-  console.log("\nServer has no TYPESAFE_API_KEY, so no judgments will run. Traces are recorded; set the key and POST /api/v1/traces/:id/evaluate to grade them.");
+  console.log("\nServer has no TYPESAFE_API_KEY: only the free code graders (sanity) run. Set the key for jev judgments, then POST /api/v1/traces/:id/evaluate to grade these.");
   process.exit(0);
 }
 console.log(`\nwaiting for jev (${health.model}) …`);
-for (const id of ids) {
+for (const id of [...ids, ...trials]) {
   const r = await waitForScores(id);
   if (!r) {
     console.log(`  ${id}: timed out`);
@@ -84,3 +105,5 @@ for (const id of ids) {
   console.log(`\n${id}`);
   for (const s of r.scores.filter((s) => s.source === "EVAL")) console.log(`  ${s.name.padEnd(32)} ${s.string_value ?? s.value?.toFixed(3)}`);
 }
+const rep = (await (await fetch(`${base}/api/v1/datasets/demo/runs/${run}`)).json()) as { pass_at_1: number | null; pass_at_k: number | null; pass_pow_k: number | null; k: number };
+console.log(`\nrun ${run}: pass@1=${rep.pass_at_1?.toFixed(2)} pass@${rep.k}=${rep.pass_at_k?.toFixed(2)} pass^${rep.k}=${rep.pass_pow_k?.toFixed(2)}`);

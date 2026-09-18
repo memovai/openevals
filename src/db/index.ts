@@ -27,6 +27,7 @@ function migrate(db: DB): void {
   };
   addColumn("judgments", "escalated_from", "TEXT");
   addColumn("judgments", "rationales", "TEXT");
+  addColumn("evaluators", "kind", "TEXT NOT NULL DEFAULT 'jev'");
 }
 
 export const nowIso = (): string => new Date().toISOString();

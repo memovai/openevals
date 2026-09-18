@@ -71,9 +71,10 @@ CREATE TABLE IF NOT EXISTS evaluators (
   id          TEXT PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
   description TEXT,
+  kind        TEXT NOT NULL DEFAULT 'jev',   -- jev (model-based, typed questions) | code (deterministic checks)
   target      TEXT NOT NULL DEFAULT 'trace', -- trace | observation
   filter      TEXT,                          -- JSON: { names?, tags?, requiresExpectedOutput?, observationTypes?, observationNames? }
-  questions   TEXT NOT NULL,                 -- JSON: jev questions map { id: { type, instructions, criteria } }
+  questions   TEXT NOT NULL,                 -- JSON: jev questions map { id: { type, instructions, criteria } }; for kind=code: { checks: CodeCheck[] }
   composite   TEXT,                          -- JSON: CompositeSpec (see eval/aggregate.ts)
   enabled     INTEGER NOT NULL DEFAULT 1,
   builtin     INTEGER NOT NULL DEFAULT 0,

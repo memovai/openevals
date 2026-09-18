@@ -3,15 +3,16 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Repo } from "../db/repo.js";
-import { evaluateTrace, escalateJudgment, scheduleTrace, type Judges } from "../eval/worker.js";
+import { evaluateTrace, escalateJudgment, type Judges } from "../eval/worker.js";
 import { buildTraceState } from "../eval/state.js";
+import { runReport, compareRuns, calibration } from "../eval/metrics.js";
 import { config } from "../config.js";
 
-export function restRoutes(repo: Repo, judges: Judges | null): Hono {
+export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: string, settleMs?: number) => void): Hono {
   const app = new Hono();
-  const judge = judges?.judge ?? null;
+  const judge = judges.judge;
 
-  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges?.escalator?.model ?? null }));
+  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges.escalator?.model ?? null, codeGraders: true }));
 
   app.get("/api/v1/stats", (c) =>
     c.json({ traces: repo.countTraces(), scores: repo.scoreStats(), judgments: repo.judgmentStats(), queue: repo.queueStats() }),
@@ -49,12 +50,11 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
   app.post("/api/v1/traces/:id/evaluate", async (c) => {
     const t = repo.getTrace(c.req.param("id"));
     if (!t) return c.json({ error: "not found" }, 404);
-    if (!judge) return c.json({ error: "evaluation disabled: TYPESAFE_API_KEY not set" }, 503);
     const only = c.req.query("evaluator");
     const force = c.req.query("force") === "1";
     const evs = repo.listEvaluators(true).filter((e) => !only || e.name === only);
     const results: Record<string, unknown> = {};
-    for (const ev of evs) results[ev.name] = await evaluateTrace(repo, judges!, ev, t.id, { force });
+    for (const ev of evs) results[ev.name] = await evaluateTrace(repo, judges, ev, t.id, { force });
     return c.json({ traceId: t.id, results });
   });
 
@@ -62,15 +62,15 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
   app.post("/api/v1/traces/:id/escalate", async (c) => {
     const t = repo.getTrace(c.req.param("id"));
     if (!t) return c.json({ error: "not found" }, 404);
-    const esc = judges?.escalator;
+    const esc = judges.escalator;
     if (!esc) return c.json({ error: "escalation disabled: ANTHROPIC_API_KEY not set or OPENEVA_ESCALATE=false" }, 503);
     const only = c.req.query("evaluator");
     const results: Record<string, unknown> = {};
     const seen = new Set<string>();
     for (const jd of repo.listJudgments(t.id)) {
-      if (jd.status !== "ok" || jd.escalated_from) continue;
+      if (jd.status !== "ok" || jd.escalated_from || jd.model === "code") continue; // code graders have nothing to second-guess
       const ev = repo.getEvaluator(jd.evaluator_id);
-      if (!ev || (only && ev.name !== only)) continue;
+      if (!ev || ev.kind === "code" || (only && ev.name !== only)) continue;
       const key = `${ev.id}:${jd.observation_id ?? ""}`;
       if (seen.has(key)) continue; // listJudgments is newest-first: only the latest per unit
       seen.add(key);
@@ -82,7 +82,7 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
   app.post("/api/v1/traces/:id/enqueue", (c) => {
     const t = repo.getTrace(c.req.param("id"));
     if (!t) return c.json({ error: "not found" }, 404);
-    scheduleTrace(repo, t.id, 0);
+    schedule(t.id, 0);
     return c.json({ ok: true });
   });
 
@@ -117,9 +117,11 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
 
   // ---- evaluators ----
   const question = z.object({ type: z.enum(["noul", "choice", "score"]), instructions: z.unknown().optional(), criteria: z.unknown().optional() });
+  const check = z.object({ name: z.string().optional(), type: z.string() }).passthrough();
   const evaluatorBody = z.object({
     name: z.string().min(1),
     description: z.string().optional(),
+    kind: z.enum(["jev", "code"]).optional(),
     target: z.enum(["trace", "observation"]).optional(),
     filter: z
       .object({
@@ -130,7 +132,8 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
         observationNames: z.array(z.string()).optional(),
       })
       .optional(),
-    questions: z.record(z.string(), question),
+    questions: z.record(z.string(), question).optional(),
+    checks: z.array(check).optional(),
     composite: z.unknown().optional(),
     enabled: z.boolean().optional(),
   });
@@ -144,7 +147,12 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
     if (!p.success) return c.json({ error: p.error.message }, 400);
     const existing = repo.getEvaluatorByName(p.data.name);
     if (existing?.builtin) return c.json({ error: "cannot overwrite a builtin evaluator; create one with a different name or toggle it via PATCH" }, 409);
-    return c.json(repo.upsertEvaluator({ ...p.data, filter: p.data.filter ?? null, composite: p.data.composite ?? null }), 201);
+    const kind = p.data.kind ?? (p.data.checks ? "code" : "jev");
+    const questions = kind === "code" ? { checks: p.data.checks ?? [] } : (p.data.questions ?? {});
+    if (kind === "code" && !p.data.checks?.length) return c.json({ error: "code evaluators need a non-empty `checks` array" }, 400);
+    if (kind === "jev" && !Object.keys(questions).length) return c.json({ error: "jev evaluators need at least one question" }, 400);
+    const { checks: _c, ...rest } = p.data;
+    return c.json(repo.upsertEvaluator({ ...rest, kind, questions, filter: p.data.filter ?? null, composite: p.data.composite ?? null }), 201);
   });
   app.patch("/api/v1/evaluators/:id", async (c) => {
     const e = repo.getEvaluator(c.req.param("id")) ?? repo.getEvaluatorByName(c.req.param("id"));
@@ -193,7 +201,7 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
     repo.linkRunItem({ dataset_id: d.id as string, run_name: c.req.param("run"), dataset_item_id: p.data.datasetItemId, trace_id: p.data.traceId });
     if (item.expected_output !== null && item.expected_output !== undefined) {
       repo.upsertTrace({ id: p.data.traceId, expected_output: item.expected_output });
-      if (config.evalEnabled) scheduleTrace(repo, p.data.traceId);
+      schedule(p.data.traceId);
     }
     return c.json({ ok: true }, 201);
   });
@@ -202,13 +210,22 @@ export function restRoutes(repo: Repo, judges: Judges | null): Hono {
     if (!d) return c.json({ error: "not found" }, 404);
     return c.json({ data: repo.listRuns(d.id as string) });
   });
+  /** Run report: pass@1, pass@k, pass^k, per-item pass rates (suspect_broken = 0/k), optional regression diff vs ?compare=<run>. ?pass=<scoreName> picks the pass score (default `passed`). */
   app.get("/api/v1/datasets/:name/runs/:run", (c) => {
     const d = repo.getDatasetByName(c.req.param("name"));
     if (!d) return c.json({ error: "not found" }, 404);
-    const items = repo.listRunItems(d.id as string, c.req.param("run"));
-    const scores = repo.scoresForTraces(items.map((i) => i.trace_id as string));
-    return c.json({ data: items.map((i) => ({ ...i, scores: scores.get(i.trace_id as string) ?? [] })) });
+    const passScore = c.req.query("pass") ?? "passed";
+    const report = runReport(c.req.param("run"), repo.runTrials(d.id as string, c.req.param("run")), passScore);
+    const cmp = c.req.query("compare");
+    const diff = cmp ? compareRuns(runReport(cmp, repo.runTrials(d.id as string, cmp), passScore), report) : undefined;
+    return c.json({ ...report, ...(diff ? { compare: { base: cmp, ...diff } } : {}) });
   });
+
+  /** Grader calibration: agreement between EVAL scores and human ANNOTATION scores of the same name on the same trace. */
+  app.get("/api/v1/calibration", (c) => c.json({ data: calibration(repo.calibrationPairs()) }));
+
+  /** Traces worth a human look: low confidence, failed, grader errors. */
+  app.get("/api/v1/review", (c) => c.json({ data: repo.reviewQueue(Number(c.req.query("limit") ?? 100)) }));
 
   return app;
 }

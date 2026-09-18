@@ -7,7 +7,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Repo } from "../db/repo.js";
-import { scheduleTrace } from "../eval/worker.js";
+
 
 const OBS_TYPES: Record<string, string> = {
   span: "SPAN",
@@ -132,7 +132,7 @@ export function applyEvent(repo: Repo, ev: z.infer<typeof eventSchema>, touched:
   touched.add(traceId);
 }
 
-export function ingestRoutes(repo: Repo, opts: { evalEnabled: boolean }): Hono {
+export function ingestRoutes(repo: Repo, opts: { schedule: (traceId: string) => void }): Hono {
   const app = new Hono();
   const handler = async (c: { req: { json: () => Promise<unknown> }; json: (v: unknown, status?: 200 | 207 | 400) => Response }) => {
     let parsed: z.infer<typeof batchSchema>;
@@ -159,7 +159,7 @@ export function ingestRoutes(repo: Repo, opts: { evalEnabled: boolean }): Hono {
       repo.db.exec("ROLLBACK");
       throw e;
     }
-    if (opts.evalEnabled) for (const t of touched) scheduleTrace(repo, t);
+    for (const t of touched) opts.schedule(t);
     return c.json({ successes, errors }, 207);
   };
   app.post("/api/public/ingestion", handler as never);

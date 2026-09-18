@@ -4,6 +4,7 @@
 import { Hono } from "hono";
 import { html, raw } from "hono/html";
 import type { Repo, ScoreRow, ObservationRow, JudgmentRow, TraceRow } from "../db/repo.js";
+import { runReport, calibration } from "../eval/metrics.js";
 
 const esc = (s: unknown): string =>
   String(s ?? "")
@@ -57,7 +58,7 @@ function layout(title: string, body: unknown, stats: { traces: number; cost: num
   const pending = (stats.queue.pending ?? 0) + (stats.queue.running ?? 0);
   return html`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} · openeva</title><style>${raw(CSS)}</style></head>
-<body><header><b><a href="/" style="color:inherit">openeva</a></b><nav><a href="/">Traces</a><a href="/evaluators">Evaluators</a><a href="/datasets">Datasets</a><a href="/api/v1/stats">API</a></nav>
+<body><header><b><a href="/" style="color:inherit">openeva</a></b><nav><a href="/">Traces</a><a href="/review">Review</a><a href="/evaluators">Evaluators</a><a href="/datasets">Datasets</a><a href="/calibration">Calibration</a><a href="/api/v1/stats">API</a></nav>
 <span class="stats">${stats.traces} traces · eval spend $${stats.cost.toFixed(4)}${pending ? ` · ${pending} queued` : ""}</span></header>
 <main>${body}</main></body></html>`;
 }
@@ -66,8 +67,13 @@ function scoreBadges(scores: ScoreRow[]) {
   const evalScores = scores.filter((s) => s.source === "EVAL");
   const byName = new Map(evalScores.map((s) => [s.name, s]));
   const out: string[] = [];
-  const pass = byName.get("passed");
-  if (pass) out.push(`<span class="badge ${pass.value ? "ok" : "bad"}">${pass.value ? "PASS" : "FAIL"}</span>`);
+  const passes = evalScores.filter((s) => s.name === "passed");
+  if (passes.length) {
+    const ok = passes.every((p) => (p.value ?? 0) >= 0.5);
+    out.push(`<span class="badge ${ok ? "ok" : "bad"}">${ok ? "PASS" : "FAIL"}</span>`);
+  }
+  const human = scores.find((s) => s.source === "ANNOTATION" && s.name === "passed");
+  if (human) out.push(`<span class="badge ${human.value ? "ok" : "bad"}">human ${human.value ? "pass" : "fail"}</span>`);
   const q = byName.get("trajectory_quality");
   if (q?.value != null) out.push(`<span class="badge">quality ${q.value.toFixed(2)}</span>`);
   const oq = byName.get("outcome_quality");
@@ -76,7 +82,7 @@ function scoreBadges(scores: ScoreRow[]) {
   if (fm?.string_value && fm.string_value !== "none") out.push(`<span class="badge warn">${esc(fm.string_value)}</span>`);
   const tc = byName.get("task_completion");
   if (tc?.value != null) out.push(`<span class="badge">completion ${tc.value.toFixed(1)}/2</span>`);
-  for (const s of scores.filter((s) => s.source !== "EVAL")) {
+  for (const s of scores.filter((s) => s.source !== "EVAL" && s.name !== "passed")) {
     out.push(`<span class="badge muted">${esc(s.name)}: ${s.string_value ?? s.value}</span>`);
   }
   return raw(out.join(""));
@@ -119,6 +125,13 @@ function judgmentView(jd: JudgmentRow, evName: string, obsName?: string | null) 
     return `<div class="card"><h2>${title} · <span class="lvl-ERROR">error</span>${jd.escalated_from ? " (escalation)" : ""}</h2><pre class="mono">${esc(jd.error)}</pre></div>`;
   }
   const answers = (jd.answers ?? {}) as Record<string, Record<string, unknown>>;
+  if (jd.model === "code") {
+    const rows = Object.values(answers)
+      .map((r) => `<tr><td class="mono">${esc(r.name)}</td><td>${r.passed ? '<span class="badge ok">pass</span>' : '<span class="badge bad">fail</span>'}</td><td class="muted">${esc(r.detail)}</td></tr>`)
+      .join("");
+    return `<div class="card"><h2>${title} <span class="muted">code grader · free</span></h2><table><tbody>${rows}</tbody></table>
+      <details style="margin-top:8px"><summary>measured features</summary><pre class="mono">${esc(pretty(jd.state))}</pre></details></div>`;
+  }
   const qs = jd.questions as Record<string, { criteria?: unknown }>;
   const rat = jd.rationales ?? {};
   const why = (id: string) => (rat[id] ? `<div class="muted" style="margin:2px 0 4px">${esc(rat[id])}</div>` : "");
@@ -209,6 +222,11 @@ export function uiRoutes(repo: Repo): Hono {
           <div class="card"><h2>Output</h2><pre class="mono">${esc(pretty(t.output))}</pre></div>
           ${t.expected_output !== null && t.expected_output !== undefined ? raw(`<div class="card"><h2>Expected output</h2><pre class="mono">${esc(pretty(t.expected_output))}</pre></div>`) : ""}
           <div class="card"><h2>Scores</h2><table><thead><tr><th>Name</th><th class="right">Value</th><th>Source</th><th>Comment</th></tr></thead><tbody>${raw(scoreRows || '<tr><td colspan="4" class="muted">none yet</td></tr>')}</tbody></table></div>
+          <div class="card"><h2>Human verdict</h2><p class="muted" style="margin:0 0 8px">Your call becomes an ANNOTATION score named <code>passed</code>; it feeds the <a href="/calibration">calibration</a> report against the model graders.</p>
+            <form method="post" action="/traces/${esc(t.id)}/annotate" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button name="verdict" value="1">✓ pass</button><button name="verdict" value="0">✗ fail</button>
+              <input name="comment" placeholder="why (optional)" style="flex:1;min-width:200px;font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)">
+            </form></div>
           ${raw([...latest.values()].map((jd) => judgmentView(jd, evNames.get(jd.evaluator_id) ?? jd.evaluator_id, jd.observation_id ? obsNames.get(jd.observation_id) ?? jd.observation_id : null)).join(""))}
         </div>
         <div><div class="card"><h2>Trajectory</h2>${obsTree(obs, scores)}</div>
@@ -221,11 +239,11 @@ export function uiRoutes(repo: Repo): Hono {
     const evs = repo.listEvaluators();
     const cards = evs
       .map(
-        (e) => `<div class="card"><h2>${esc(e.name)} <span class="muted">v${e.version}${e.builtin ? " · builtin" : ""} · ${e.target === "observation" ? "per observation" : "per trace"} · ${e.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge bad">disabled</span>'}</span>
+        (e) => `<div class="card"><h2>${esc(e.name)} <span class="muted">v${e.version}${e.builtin ? " · builtin" : ""} · ${e.kind === "code" ? "code grader" : "jev"} · ${e.target === "observation" ? "per observation" : "per trace"} · ${e.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge bad">disabled</span>'}</span>
           <form class="inline" method="post" action="/evaluators/${esc(e.id)}/toggle"><button>${e.enabled ? "disable" : "enable"}</button></form></h2>
           <p>${esc(e.description ?? "")}</p>
           ${e.filter ? `<p class="muted mono">filter: ${esc(JSON.stringify(e.filter))}</p>` : ""}
-          <details><summary>${Object.keys(e.questions).length} questions</summary><pre class="mono">${esc(pretty(e.questions))}</pre></details>
+          <details><summary>${e.kind === "code" ? `${((e.questions as { checks?: unknown[] }).checks ?? []).length} checks` : `${Object.keys(e.questions).length} questions`}</summary><pre class="mono">${esc(pretty(e.questions))}</pre></details>
           ${e.composite ? `<details><summary>composite</summary><pre class="mono">${esc(pretty(e.composite))}</pre></details>` : ""}</div>`,
       )
       .join("");
@@ -238,17 +256,58 @@ export function uiRoutes(repo: Repo): Hono {
     const rows = ds
       .map((d) => {
         const runs = repo.listRuns(d.id as string);
+        const pct = (v: number | null | undefined) => (v == null ? "–" : (v * 100).toFixed(0) + "%");
         const runRows = runs
-          .map(
-            (r) =>
-              `<tr><td class="mono">${esc(r.run_name)}</td><td class="right">${r.n}</td><td class="right">${r.avg_quality != null ? Number(r.avg_quality).toFixed(2) : "–"}</td><td class="right">${r.pass_rate != null ? (Number(r.pass_rate) * 100).toFixed(0) + "%" : "–"}</td><td class="muted mono">${fmtTs(String(r.started_at))}</td></tr>`,
-          )
+          .map((r) => {
+            const rep = runReport(String(r.run_name), repo.runTrials(d.id as string, String(r.run_name)));
+            const broken = rep.per_item.filter((i) => i.suspect_broken).length;
+            return `<tr><td class="mono"><a href="/api/v1/datasets/${esc(d.name)}/runs/${esc(r.run_name)}">${esc(r.run_name)}</a></td><td class="right">${rep.items}</td><td class="right">${rep.trials_per_item.toFixed(1)}</td><td class="right">${pct(rep.pass_at_1)}</td><td class="right">${pct(rep.pass_at_k)}</td><td class="right">${pct(rep.pass_pow_k)}</td><td class="right">${rep.avg.trajectory_quality != null ? rep.avg.trajectory_quality.toFixed(2) : "–"}</td><td class="right">${broken ? `<span class="badge warn">${broken}</span>` : "0"}</td><td class="muted mono">${fmtTs(String(r.started_at))}</td></tr>`;
+          })
           .join("");
         return `<div class="card"><h2>${esc(d.name)} <span class="muted">${d.item_count} items</span></h2><p class="muted">${esc(d.description ?? "")}</p>
-          <table><thead><tr><th>Run</th><th class="right">Traces</th><th class="right">Avg quality</th><th class="right">Pass rate</th><th>Started</th></tr></thead><tbody>${runRows || '<tr><td colspan="5" class="muted">no runs</td></tr>'}</tbody></table></div>`;
+          <table><thead><tr><th>Run</th><th class="right">Items</th><th class="right">Trials/item</th><th class="right">pass@1</th><th class="right">pass@k</th><th class="right">pass^k</th><th class="right">Avg quality</th><th class="right">0/k items</th><th>Started</th></tr></thead><tbody>${runRows || '<tr><td colspan="9" class="muted">no runs</td></tr>'}</tbody></table>
+          <p class="muted" style="margin:8px 0 0;font-size:12px">pass@k = at least one of k trials passed · pass^k = all k trials passed (k = min trials per item) · 0/k items = never passed across ≥3 trials, usually a broken task rather than a weak agent. Add <code>?compare=&lt;run&gt;</code> to the run JSON for regressions.</p></div>`;
       })
       .join("");
     return c.html(layout("Datasets", html`<h1>Datasets</h1>${raw(rows || '<p class="muted">No datasets. Create one via <code>POST /api/v1/datasets</code>.</p>')}`, stats()));
+  });
+
+  app.get("/review", (c) => {
+    const q = repo.reviewQueue(200);
+    const rows = q
+      .map(({ trace, reasons }) => {
+        const sc = repo.listScores(trace.id);
+        return `<tr><td class="mono muted">${fmtTs(trace.timestamp)}</td><td><a href="/traces/${esc(trace.id)}">${esc(trace.name ?? trace.id.slice(0, 8))}</a></td><td>${reasons.map((r) => `<span class="badge ${r === "annotated" ? "ok" : "warn"}">${esc(r)}</span>`).join("")}</td><td>${scoreBadges(sc)}</td></tr>`;
+      })
+      .join("");
+    const body = html`<h1>Review queue</h1><p class="muted">Traces where the graders were unsure, failed the run, or errored. Read the transcript, then leave a human verdict on the trace page — that is how the model graders get calibrated. "Failures should seem fair."</p>
+      <table><thead><tr><th>Time</th><th>Trace</th><th>Why</th><th>Scores</th></tr></thead><tbody>${raw(rows || '<tr><td colspan="4" class="muted">nothing to review</td></tr>')}</tbody></table>`;
+    return c.html(layout("Review", body, stats()));
+  });
+
+  app.get("/calibration", (c) => {
+    const rows = calibration(repo.calibrationPairs());
+    const f = (v: number | null) => (v == null ? "–" : v.toFixed(2));
+    const tr = rows
+      .map(
+        (r) =>
+          `<tr><td class="mono">${esc(r.name)}</td><td class="right">${r.n}</td><td class="right">${r.agreement == null ? "–" : (r.agreement * 100).toFixed(0) + "%"}</td><td class="right">${f(r.kappa)}</td><td class="right">${f(r.mae)}</td><td class="right">${f(r.pearson_r)}</td><td class="right ${r.false_pass ? "lvl-ERROR" : ""}">${r.false_pass}</td><td class="right">${r.false_fail}</td></tr>`,
+      )
+      .join("");
+    const body = html`<h1>Grader calibration</h1><p class="muted">For every score that has both a model (EVAL) and a human (ANNOTATION) value on the same trace. Annotate from the trace page or <code>POST /api/v1/scores</code> with the same score name. <b>false pass</b> = grader said pass, human said fail — the direction that hides real failures.</p>
+      <table><thead><tr><th>Score</th><th class="right">n</th><th class="right">Agreement</th><th class="right">κ</th><th class="right">MAE</th><th class="right">Pearson r</th><th class="right">False pass</th><th class="right">False fail</th></tr></thead><tbody>${raw(tr || '<tr><td colspan="8" class="muted">no human annotations yet</td></tr>')}</tbody></table>`;
+    return c.html(layout("Calibration", body, stats()));
+  });
+
+  app.post("/traces/:id/annotate", async (c) => {
+    const id = c.req.param("id");
+    const form = await c.req.parseBody();
+    const verdict = form.verdict === "1" ? 1 : form.verdict === "0" ? 0 : null;
+    if (verdict !== null && repo.getTrace(id)) {
+      repo.db.prepare("DELETE FROM scores WHERE trace_id = ? AND source = 'ANNOTATION' AND name = 'passed' AND observation_id IS NULL").run(id);
+      repo.insertScore({ trace_id: id, observation_id: null, name: "passed", value: verdict, string_value: null, data_type: "BOOLEAN", source: "ANNOTATION", comment: typeof form.comment === "string" && form.comment ? form.comment : null, metadata: { via: "ui" }, evaluator_id: null, judgment_id: null });
+    }
+    return c.redirect(`/traces/${id}`);
   });
 
   // tiny form handlers (redirect back)

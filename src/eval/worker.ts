@@ -11,6 +11,7 @@ import { answersToScores, hasUndecidedNoul, minConfidence, type CompositeSpec } 
 import { costUsd, type Judge } from "./jev.js";
 import type { Escalator } from "./escalate.js";
 import type { Questions } from "@typesafe-ai/sdk";
+import { runCodeChecks, type CodeCheck } from "./code.js";
 
 export interface WorkerLogger {
   info(msg: string, ...a: unknown[]): void;
@@ -62,7 +63,8 @@ export interface EvalOutcome {
 }
 
 export interface Judges {
-  judge: Judge;
+  /** null → only code graders run; jev evaluators are not scheduled */
+  judge: Judge | null;
   escalator?: Escalator | null;
 }
 
@@ -89,6 +91,41 @@ function writeScores(repo: Repo, unit: Unit, ev: EvaluatorRow, judgment: Judgmen
     repo.db.exec("ROLLBACK");
     throw e;
   }
+}
+
+/**
+ * Cache hit handling. Same trace+unit → nothing to do. A different trace with identical
+ * state (re-runs of a deterministic agent, duplicate imports) → reuse the answers at zero
+ * cost, but materialise a judgment + scores for THIS trace so it is graded too.
+ */
+function reuseCached(repo: Repo, cached: JudgmentRow, unit: Unit, ev: EvaluatorRow): EvalOutcome {
+  if (cached.trace_id === unit.trace.id && (cached.observation_id ?? null) === (unit.observationId ?? null)) {
+    return { status: "cached", judgmentId: cached.id, costUsd: 0 };
+  }
+  const clone = repo.insertJudgment({
+    evaluator_id: ev.id,
+    evaluator_version: ev.version,
+    trace_id: unit.trace.id,
+    observation_id: unit.observationId,
+    model: cached.model,
+    state: unit.state,
+    state_hash: cached.state_hash,
+    state_meta: { ...(unit.meta as unknown as Record<string, unknown>), cached_from: cached.id },
+    questions: unit.questions as Record<string, unknown>,
+    answers: cached.answers,
+    usage_input: 0,
+    usage_output: 0,
+    cost_usd: 0,
+    latency_ms: 0,
+    min_confidence: cached.min_confidence,
+    needs_review: cached.needs_review,
+    status: "ok",
+    error: null,
+    escalated_from: null,
+    rationales: cached.rationales,
+  });
+  writeScores(repo, unit, ev, clone, cached.model ?? "cached", cached.rationales);
+  return { status: "cached", judgmentId: clone.id, costUsd: 0 };
 }
 
 function needsEscalation(minConf: number | null, answers: Record<string, unknown>): boolean {
@@ -159,8 +196,9 @@ async function judgeUnit(repo: Repo, judges: Judges, ev: EvaluatorRow, unit: Uni
   const stateHash = hashState({ state: unit.state, questions: unit.questions, observationId: unit.observationId });
   if (!opts.force) {
     const cached = repo.findJudgmentByHash(ev.id, ev.version, stateHash);
-    if (cached) return { status: "cached", judgmentId: cached.id, costUsd: 0 };
+    if (cached) return reuseCached(repo, cached, unit, ev);
   }
+  if (!judges.judge) return { status: "skipped", reason: "no judge configured (TYPESAFE_API_KEY)" };
   try {
     const res = await judges.judge.judge(unit.state, unit.questions);
     const minConf = minConfidence(res.answers);
@@ -207,7 +245,7 @@ async function judgeUnit(repo: Repo, judges: Judges, ev: EvaluatorRow, unit: Uni
       evaluator_version: ev.version,
       trace_id: unit.trace.id,
       observation_id: unit.observationId,
-      model: judges.judge.model,
+      model: judges.judge?.model ?? "jev",
       state: unit.state,
       state_hash: stateHash,
       state_meta: unit.meta as unknown as Record<string, unknown>,
@@ -228,12 +266,65 @@ async function judgeUnit(repo: Repo, judges: Judges, ev: EvaluatorRow, unit: Uni
   }
 }
 
+/** Deterministic checks: free, no model call. Each check becomes a BOOLEAN score; plus `<name>_score` (fraction passed) and `passed`. */
+export function evaluateWithCode(repo: Repo, ev: EvaluatorRow, trace: TraceRow, observations: ObservationRow[], opts: { force?: boolean } = {}): EvalOutcome {
+  const checks = ((ev.questions as { checks?: CodeCheck[] }).checks ?? []) as CodeCheck[];
+  if (!checks.length) return { status: "skipped", reason: "no checks" };
+  const { results, features } = runCodeChecks(trace, observations, checks);
+  // Code checks are free, so the cache only serves to avoid duplicate judgment rows for the same trace.
+  const stateHash = hashState({ features, checks, output: trace.output, expected: trace.expected_output });
+  if (!opts.force) {
+    const cached = repo.findJudgmentByHash(ev.id, ev.version, stateHash);
+    if (cached && cached.trace_id === trace.id) return { status: "cached", judgmentId: cached.id, costUsd: 0 };
+  }
+  const judgment = repo.insertJudgment({
+    evaluator_id: ev.id,
+    evaluator_version: ev.version,
+    trace_id: trace.id,
+    observation_id: null,
+    model: "code",
+    state: features,
+    state_hash: stateHash,
+    state_meta: null,
+    questions: { checks } as unknown as Record<string, unknown>,
+    answers: Object.fromEntries(results.map((r) => [r.name, r])),
+    usage_input: 0,
+    usage_output: 0,
+    cost_usd: 0,
+    latency_ms: 0,
+    min_confidence: null,
+    needs_review: false,
+    status: "ok",
+    error: null,
+    escalated_from: null,
+    rationales: null,
+  });
+  const base = { trace_id: trace.id, observation_id: null, source: "EVAL" as const, evaluator_id: ev.id, judgment_id: judgment.id };
+  const passedAll = results.every((r) => r.passed);
+  const frac = results.filter((r) => r.passed).length / results.length;
+  repo.db.exec("BEGIN");
+  try {
+    repo.deleteEvalScores(trace.id, ev.id, null);
+    for (const r of results) {
+      repo.insertScore({ ...base, name: r.name, value: r.passed ? 1 : 0, string_value: null, data_type: "BOOLEAN", comment: r.detail, metadata: { model: "code", kind: "check", type: r.type, ...(r.value !== undefined ? { measured: r.value } : {}) } });
+    }
+    repo.insertScore({ ...base, name: `${ev.name}_score`, value: frac, string_value: null, data_type: "NUMERIC", comment: `${results.filter((r) => r.passed).length}/${results.length} checks passed`, metadata: { model: "code", kind: "composite" } });
+    repo.insertScore({ ...base, name: (ev.composite as { passName?: string } | null)?.passName ?? "passed", value: passedAll ? 1 : 0, string_value: null, data_type: "BOOLEAN", comment: passedAll ? "all checks passed" : `failed: ${results.filter((r) => !r.passed).map((r) => r.name).join(", ")}`, metadata: { model: "code", kind: "pass" } });
+    repo.db.exec("COMMIT");
+  } catch (e) {
+    repo.db.exec("ROLLBACK");
+    throw e;
+  }
+  return { status: "judged", judgmentId: judgment.id, costUsd: 0, latencyMs: 0 };
+}
+
 export async function evaluateTrace(repo: Repo, judges: Judges | Judge, ev: EvaluatorRow, traceId: string, opts: { force?: boolean } = {}): Promise<EvalOutcome> {
   const J: Judges = "judge" in judges && typeof (judges as Judges).judge === "object" ? (judges as Judges) : { judge: judges as Judge };
   const trace = repo.getTrace(traceId);
   if (!trace) return { status: "skipped", reason: "trace not found" };
   if (!evaluatorApplies(ev, trace)) return { status: "skipped", reason: "filter" };
   const observations = repo.listObservations(traceId);
+  if (ev.kind === "code") return evaluateWithCode(repo, ev, trace, observations, opts);
   const questions = applicableQuestions(ev, trace);
   if (!Object.keys(questions).length) return { status: "skipped", reason: "no applicable questions" };
 
@@ -315,9 +406,10 @@ export class EvalWorker {
   }
 }
 
-/** Called by ingestion: schedule every enabled evaluator for this trace after the settle delay. */
-export function scheduleTrace(repo: Repo, traceId: string, settleMs = config.settleMs): void {
-  const evs = repo.listEvaluators(true);
+/** Called by ingestion: schedule every enabled, runnable evaluator for this trace after the settle delay. */
+export function scheduleTrace(repo: Repo, traceId: string, settleMs = config.settleMs, opts: { hasJudge?: boolean } = {}): void {
+  const hasJudge = opts.hasJudge ?? true;
+  const evs = repo.listEvaluators(true).filter((e) => e.kind === "code" || hasJudge);
   if (!evs.length) return;
   repo.enqueue(
     traceId,
@@ -328,13 +420,14 @@ export function scheduleTrace(repo: Repo, traceId: string, settleMs = config.set
 
 export function ensureBuiltins(
   repo: Repo,
-  builtins: { name: string; description: string; target?: "trace" | "observation"; filter: unknown; questions: Record<string, unknown>; composite: unknown; enabledByDefault?: boolean }[],
+  builtins: { name: string; description: string; kind?: "jev" | "code"; target?: "trace" | "observation"; filter: unknown; questions: Record<string, unknown>; composite: unknown; enabledByDefault?: boolean }[],
 ): void {
   for (const b of builtins) {
     const existing = repo.getEvaluatorByName(b.name);
     repo.upsertEvaluator({
       name: b.name,
       description: b.description,
+      kind: b.kind ?? "jev",
       target: b.target ?? "trace",
       filter: b.filter as never,
       questions: b.questions,

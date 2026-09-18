@@ -69,6 +69,7 @@ export interface EvaluatorRow {
   id: string;
   name: string;
   description: string | null;
+  kind: "jev" | "code";
   target: "trace" | "observation";
   filter: EvaluatorFilter | null;
   questions: Record<string, unknown>;
@@ -395,11 +396,12 @@ export class Repo {
       const changed = JSON.stringify(existing.questions) !== JSON.stringify(e.questions) || JSON.stringify(existing.composite ?? null) !== JSON.stringify(e.composite ?? null);
       this.db
         .prepare(
-          `UPDATE evaluators SET description = ?, target = ?, filter = ?, questions = ?, composite = ?, enabled = ?, builtin = ?,
+          `UPDATE evaluators SET description = ?, kind = ?, target = ?, filter = ?, questions = ?, composite = ?, enabled = ?, builtin = ?,
              version = ?, updated_at = ? WHERE id = ?`,
         )
         .run(
           e.description ?? existing.description,
+          e.kind ?? existing.kind,
           e.target ?? existing.target,
           j(e.filter ?? existing.filter),
           JSON.stringify(e.questions),
@@ -415,10 +417,10 @@ export class Repo {
     const id = e.id ?? randomUUID();
     this.db
       .prepare(
-        `INSERT INTO evaluators (id, name, description, target, filter, questions, composite, enabled, builtin, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        `INSERT INTO evaluators (id, name, description, kind, target, filter, questions, composite, enabled, builtin, version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
       )
-      .run(id, e.name, e.description ?? null, e.target ?? "trace", j(e.filter), JSON.stringify(e.questions), j(e.composite ?? null), (e.enabled ?? true) ? 1 : 0, e.builtin ? 1 : 0, now, now);
+      .run(id, e.name, e.description ?? null, e.kind ?? "jev", e.target ?? "trace", j(e.filter), JSON.stringify(e.questions), j(e.composite ?? null), (e.enabled ?? true) ? 1 : 0, e.builtin ? 1 : 0, now, now);
     return this.getEvaluator(id)!;
   }
 
@@ -613,6 +615,48 @@ export class Repo {
       )
       .all(datasetId) as Raw[];
   }
+  /** Every (item, trace) in a run with that trace's EVAL/ANNOTATION scores — the input for pass@k / pass^k. */
+  runTrials(datasetId: string, runName: string): { dataset_item_id: string; trace_id: string; created_at: string; scores: ScoreRow[] }[] {
+    const items = this.listRunItems(datasetId, runName) as { dataset_item_id: string; trace_id: string; created_at: string }[];
+    const scores = this.scoresForTraces(items.map((i) => i.trace_id));
+    return items.map((i) => ({ ...i, scores: scores.get(i.trace_id) ?? [] }));
+  }
+
+  /** Traces where a model grader and a human disagree, or that are flagged for review. */
+  reviewQueue(limit = 100): { trace: TraceRow; reasons: string[] }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT t.* FROM traces t
+         WHERE EXISTS (SELECT 1 FROM judgments jd WHERE jd.trace_id = t.id AND jd.needs_review = 1)
+            OR EXISTS (SELECT 1 FROM scores s WHERE s.trace_id = t.id AND s.source = 'EVAL' AND s.data_type = 'BOOLEAN' AND s.value = 0
+                         AND json_extract(s.metadata, '$.kind') = 'pass')
+            OR EXISTS (SELECT 1 FROM judgments jd WHERE jd.trace_id = t.id AND jd.status = 'error')
+         ORDER BY t.timestamp DESC LIMIT ?`,
+      )
+      .all(limit) as Raw[];
+    return rows.map(traceFromRaw).map((trace) => {
+      const reasons: string[] = [];
+      const jd = this.listJudgments(trace.id);
+      if (jd.some((x) => x.needs_review)) reasons.push("low confidence");
+      if (jd.some((x) => x.status === "error")) reasons.push("grader error");
+      const sc = this.listScores(trace.id);
+      if (sc.some((x) => x.source === "EVAL" && x.data_type === "BOOLEAN" && x.value === 0 && x.metadata?.kind === "pass")) reasons.push("failed");
+      if (sc.some((x) => x.source === "ANNOTATION")) reasons.push("annotated");
+      return { trace, reasons };
+    });
+  }
+
+  /** All (trace, name) pairs that carry both an EVAL and an ANNOTATION score — grader calibration data. */
+  calibrationPairs(): { trace_id: string; name: string; eval_value: number | null; eval_str: string | null; human_value: number | null; human_str: string | null; data_type: string }[] {
+    return this.db
+      .prepare(
+        `SELECT e.trace_id, e.name, e.value AS eval_value, e.string_value AS eval_str, h.value AS human_value, h.string_value AS human_str, e.data_type
+         FROM scores e JOIN scores h ON h.trace_id = e.trace_id AND h.name = e.name AND h.source = 'ANNOTATION'
+         WHERE e.source = 'EVAL' AND e.observation_id IS NULL AND h.observation_id IS NULL`,
+      )
+      .all() as never;
+  }
+
   listRunItems(datasetId: string, runName: string): Raw[] {
     return this.db.prepare("SELECT * FROM dataset_run_items WHERE dataset_id = ? AND run_name = ? ORDER BY created_at").all(datasetId, runName) as Raw[];
   }

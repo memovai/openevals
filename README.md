@@ -56,11 +56,33 @@ await eva.flush();
 
 | name | runs on | questions |
 |---|---|---|
+| `sanity` | every trace, **code grader, free** | `output_nonempty`, `no_unresolved_error`, `max_steps ≤ 200`, `max_repeated_tool_call ≤ 5` → `sanity_score`, `sanity_passed` |
 | `trajectory` | every trace | `task_completion` (Score 0–2), `instruction_following`, `grounded_in_evidence`, `wasted_effort` (Score 0–2), `tool_use_appropriate`, `recovered_from_errors`, `unsafe_or_out_of_scope_action` (Noul), `failure_mode` (Choice) → composite `trajectory_quality`, `passed` |
 | `outcome` | traces with `expected_output` | `matches_expected`, `match_quality` (Score 0–2), `contradicts_expected` → `outcome_quality`, `outcome_passed` |
 | `tool_call` | every `TOOL` observation (**disabled by default**: one request per tool call) | `arguments_appropriate`, `result_usefulness` (Score 0–2), `redundant_call` → `tool_call_quality` |
 
-### Custom evaluators
+### Code graders (deterministic, free)
+
+Anything with a crisp answer should not cost a model call. A `kind: "code"` evaluator is a list of checks; each becomes a BOOLEAN score, plus `<name>_score` (fraction passed) and a pass score (`passed` by default, or `composite.passName`).
+
+```bash
+curl -X POST localhost:3100/api/v1/evaluators -H 'content-type: application/json' -d '{
+  "name": "booking-limits",
+  "filter": { "names": ["travel-agent"] },
+  "checks": [
+    { "type": "required_tools", "tools": ["flight_search"] },
+    { "type": "forbidden_tools", "tools": ["send_email"] },
+    { "type": "max_tool_calls", "value": 8 },
+    { "type": "max_repeated_tool_call", "value": 2 },
+    { "type": "output_regex", "pattern": "\\$\\d+" },
+    { "type": "output_contains_expected" }
+  ]
+}'
+```
+
+Check types: `output_nonempty`, `output_contains`, `output_not_contains`, `output_regex`, `output_equals_expected`, `output_contains_expected` (normalised by default), `output_max_chars`, `output_json`, `max_steps`, `max_tool_calls`, `max_llm_calls`, `max_duration_ms`, `max_total_tokens`, `max_cost_usd`, `no_errors`, `no_unresolved_error`, `required_tools`, `forbidden_tools`, `max_repeated_tool_call`. Per the eval guide, prefer grading *what was produced* (output checks, final state) over rigid step sequences; `required_tools` is there for the cases where a tool call genuinely is the outcome (e.g. "the refund was processed").
+
+### Custom jev evaluators
 
 ```bash
 curl -X POST localhost:3100/api/v1/evaluators -H 'content-type: application/json' -d '{
@@ -80,6 +102,38 @@ curl -X POST localhost:3100/api/v1/evaluators -H 'content-type: application/json
 
 Trace-level questions see `task`, `final_output`, `expected_output` (if any), `trajectory[]` (`type`, `name`, `input`, `output`, `level`, `status_message`, `duration_ms`), and `stats`. Observation-level questions (`"target": "observation"`) see `task`, `step`, and `context`. Write questions in English (jev's strongest language); the trajectory itself can be in any language. Transforms: `noul`, `noul_inverted`, `score_norm`, `score_norm_inverted`, `choice_is` (with `option`).
 
+## Datasets, trials, pass@k / pass^k
+
+A dataset holds tasks (`input`, `expected_output`); a run links each trial's trace to its item. Run the same item several times to get **pass@k** (at least one of k trials passed) and **pass^k** (all k passed, the reliability bar). `GET /api/v1/datasets/:name/runs/:run` returns both plus per-item pass rates; items with 0 passes across ≥3 trials are flagged `suspect_broken` (the guide: "0% pass@100 is most often a broken task"). Add `?compare=<other run>` for `regressions` / `fixes`. `?pass=<score>` picks which pass score counts (default `passed`; all pass-type scores on a trace must be true).
+
+```bash
+curl -X POST localhost:3100/api/v1/datasets/booking/items -H 'content-type: application/json' \
+  -d '{"items":[{"id":"sfo-jfk","input":"cheapest direct SFO→JFK on 2026-10-03, max $400","expectedOutput":"…"}]}'
+# for each trial: run your agent with tracing on, then
+curl -X POST localhost:3100/api/v1/datasets/booking/runs/v12/items -H 'content-type: application/json' \
+  -d '{"datasetItemId":"sfo-jfk","traceId":"<trace id from the run>"}'
+curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
+```
+
+## Humans in the loop: review queue and calibration
+
+- `/review` lists traces that failed, had low-confidence judgments, or errored. Read the transcript; press **pass** / **fail** on the trace page (or `POST /api/v1/scores` with `name: "passed"`) — that writes an ANNOTATION score.
+- `/calibration` (`GET /api/v1/calibration`) compares every EVAL score against the ANNOTATION of the same name on the same trace: agreement, Cohen's κ, MAE, Pearson r, and **false pass** (grader said pass, human said fail — the direction that hides real failures). This is how you know whether to trust jev on your domain and where to tighten a rubric.
+
+## How this maps to Anthropic's "Demystifying evals for AI agents"
+
+| guide | openeva |
+|---|---|
+| Three grader types: code, model, human | `kind: "code"` evaluators (free), jev evaluators (typed questions), ANNOTATION scores via UI/API |
+| "grade each dimension with an isolated LLM-as-judge" | jev evaluates every question independently against the same state — one request, isolated judgments by construction |
+| "give the grader a way out" | Noul ≈ 0.5 and low `confidence` trigger `needs_review` / escalation; `failure_mode` has `cannot_determine` |
+| Partial credit, weighted / binary / hybrid scoring | `composite.terms` (weighted) + `composite.pass` (binary gates) |
+| Grade outcomes, avoid brittle step-checking | trajectory evaluator weights `task_completion` 0.4, process questions low; code checks target output/state |
+| Trials, pass@k, pass^k, broken-task detection | dataset runs report all three; `suspect_broken` on 0/k items |
+| Capability → regression graduation | `?compare=<run>` returns `regressions` / `fixes`; run pass^k against your regression set in CI |
+| Calibrate model graders against humans | `/calibration` on paired EVAL / ANNOTATION scores |
+| Read the transcripts | `/review` queue, full trajectory tree, exact state and answers stored per judgment |
+
 ## API
 
 | method | path | |
@@ -95,10 +149,13 @@ Trace-level questions see `task`, `final_output`, `expected_output` (if any), `t
 | GET/POST/PATCH/DELETE | `/api/v1/evaluators[/:id]` | manage evaluators (`PATCH {enabled}`) |
 | POST | `/api/v1/datasets`, `/api/v1/datasets/:name/items` | reference sets |
 | POST | `/api/v1/datasets/:name/runs/:run/items` | link a trace to an item; copies `expected_output` onto the trace so `outcome` grades it |
-| GET | `/api/v1/datasets/:name/runs` | per-run avg quality / pass rate |
+| GET | `/api/v1/datasets/:name/runs` | list runs |
+| GET | `/api/v1/datasets/:name/runs/:run?compare=&pass=` | pass@1 / pass@k / pass^k, per-item, regressions |
+| GET | `/api/v1/review` | traces needing a human look |
+| GET | `/api/v1/calibration` | grader-vs-human agreement per score |
 | GET | `/api/v1/stats`, `/api/v1/health` | |
 
-UI: `/` traces, `/traces/:id` trajectory tree + probability bars per question, `/evaluators`, `/datasets`.
+UI: `/` traces, `/traces/:id` trajectory tree + probability bars per question + human verdict, `/review`, `/evaluators`, `/datasets` (pass@k table), `/calibration`.
 
 ## Layout
 
@@ -117,7 +174,9 @@ src/
   eval/state.ts    trajectory → jev state (compaction + hash)
   eval/jev.ts      TypeSafe SDK wrapper
   eval/escalate.ts Claude second opinion for low-confidence judgments
-  eval/builtin.ts  built-in rubrics
+  eval/builtin.ts  built-in rubrics + sanity checks
+  eval/code.ts     deterministic code graders
+  eval/metrics.ts  pass@k / pass^k / regressions / calibration
   eval/aggregate.ts answers → scores, composite, pass rules
   eval/worker.ts   queue, caching, scheduling
   sdk/index.ts     client SDK

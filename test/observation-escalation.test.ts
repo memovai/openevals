@@ -152,6 +152,7 @@ describe("escalation", () => {
     await worker!.tick();
     expect(esc.calls).toBe(0);
     expect(repo.listJudgments("t1").every((j) => !j.needs_review)).toBe(true);
+    expect(repo.listJudgments("t1").some((j) => j.model === "code")).toBe(true); // sanity ran for free
   });
 
   it("escalates low-confidence judgments, replaces scores with rationales, keeps audit chain", async () => {
@@ -162,7 +163,7 @@ describe("escalation", () => {
     repo.db.exec("UPDATE eval_queue SET not_before = '2000-01-01'");
     await worker!.tick();
     expect(esc.calls).toBe(1); // only `trajectory` ran (no expected output, tool_call disabled)
-    const jds = repo.listJudgments("t1");
+    const jds = repo.listJudgments("t1").filter((j) => j.model !== "code");
     expect(jds).toHaveLength(2);
     const escalated = jds.find((j) => j.escalated_from)!;
     const original = jds.find((j) => !j.escalated_from)!;
@@ -170,11 +171,11 @@ describe("escalation", () => {
     expect(escalated.model).toBe("claude-fake");
     expect(escalated.rationales?.task_completion).toBe("because task_completion");
     expect(original.needs_review).toBe(false); // cleared once the second opinion landed
-    const scores = repo.listScores("t1").filter((s) => s.source === "EVAL");
+    const scores = repo.listScores("t1").filter((s) => s.source === "EVAL" && s.metadata?.model !== "code");
     // scores now come from the escalation: level 0 → task_completion 0, choice = last option
     expect(scores.find((s) => s.name === "task_completion")?.value).toBe(0);
     expect(scores.find((s) => s.name === "task_completion")?.comment).toBe("because task_completion");
-    expect(scores.find((s) => s.name === "failure_mode")?.string_value).toBe("other");
+    expect(scores.find((s) => s.name === "failure_mode")?.string_value).toBe("cannot_determine"); // fake escalator picks the last option
     expect(scores.find((s) => s.name === "passed")?.value).toBe(0);
     expect(scores.every((s) => s.metadata?.escalated === true)).toBe(true);
     expect(scores.every((s) => s.judgment_id === escalated.id)).toBe(true);

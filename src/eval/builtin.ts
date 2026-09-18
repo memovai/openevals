@@ -13,6 +13,7 @@ import type { EvaluatorFilter } from "../db/repo.js";
 export interface BuiltinEvaluator {
   name: string;
   description: string;
+  kind?: "jev" | "code";
   target?: "trace" | "observation";
   filter: EvaluatorFilter | null;
   questions: Record<string, unknown>;
@@ -111,6 +112,7 @@ export const trajectoryEvaluator: BuiltinEvaluator = {
         ignored_instructions: "The agent disregarded an explicit constraint in `task`.",
         environment_failure: "External tools or services failed in ways the agent could not reasonably work around.",
         other: "A significant problem not covered by the other options.",
+        cannot_determine: "The trajectory does not contain enough information to tell what went wrong (e.g. steps were omitted or outputs are missing).",
       },
     },
   },
@@ -214,4 +216,21 @@ export const toolCallEvaluator: BuiltinEvaluator = {
   },
 };
 
-export const builtinEvaluators: BuiltinEvaluator[] = [trajectoryEvaluator, outcomeEvaluator, toolCallEvaluator];
+/** Free, deterministic sanity checks (code-based grader). Runs on every trace before any model grader. */
+export const sanityEvaluator: BuiltinEvaluator = {
+  name: "sanity",
+  description: "Deterministic checks that need no model: the run produced output, did not end on an error, did not explode in steps, and did not hammer one tool with identical arguments. Free. Tighten the limits or add required_tools / output_regex checks for your agent.",
+  kind: "code",
+  filter: null,
+  questions: {
+    checks: [
+      { type: "output_nonempty" },
+      { type: "no_unresolved_error" },
+      { type: "max_steps", value: 200 },
+      { name: "no_identical_retry_storm", type: "max_repeated_tool_call", value: 5 },
+    ],
+  },
+  composite: { name: "sanity_score", terms: [], passName: "sanity_passed" },
+};
+
+export const builtinEvaluators: BuiltinEvaluator[] = [sanityEvaluator, trajectoryEvaluator, outcomeEvaluator, toolCallEvaluator];
