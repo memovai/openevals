@@ -1,0 +1,93 @@
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { logger } from "hono/logger";
+import { config } from "./config.js";
+import { openDb } from "./db/index.js";
+import { Repo } from "./db/repo.js";
+import { ingestRoutes } from "./api/ingest.js";
+import { otelRoutes } from "./api/otel.js";
+import { restRoutes } from "./api/rest.js";
+import { uiRoutes } from "./ui/pages.js";
+import { judgeFromEnv, type Judge } from "./eval/jev.js";
+import { escalatorFromEnv, type Escalator } from "./eval/escalate.js";
+import { EvalWorker, ensureBuiltins, escalateJudgment, evaluateTrace, scheduleTrace, type Judges } from "./eval/worker.js";
+import { builtinEvaluators } from "./eval/builtin.js";
+
+export interface AppOptions {
+  dbPath?: string;
+  judge?: Judge | null;
+  escalator?: Escalator | null;
+  apiKey?: string;
+  evalEnabled?: boolean;
+  quiet?: boolean;
+}
+
+export function createApp(opts: AppOptions = {}) {
+  const db = openDb(opts.dbPath ?? config.dbPath);
+  const repo = new Repo(db);
+  ensureBuiltins(repo, builtinEvaluators);
+  const judge = opts.judge === undefined ? judgeFromEnv() : opts.judge;
+  const escalator = opts.escalator === undefined ? escalatorFromEnv() : opts.escalator;
+  const judges: Judges | null = judge ? { judge, escalator } : null;
+  const evalEnabled = (opts.evalEnabled ?? config.evalEnabled) && !!judge;
+
+  const app = new Hono();
+  if (!opts.quiet) app.use(logger());
+
+  const apiKey = opts.apiKey ?? config.apiKey;
+  if (apiKey) {
+    app.use("/api/*", async (c, next) => {
+      const h = c.req.header("authorization") ?? "";
+      let ok = h === `Bearer ${apiKey}`;
+      if (!ok && h.startsWith("Basic ")) {
+        // Langfuse SDKs send Basic <publicKey>:<secretKey>; accept the secret half.
+        const decoded = Buffer.from(h.slice(6), "base64").toString("utf8");
+        ok = decoded.split(":").pop() === apiKey;
+      }
+      if (!ok) return c.json({ error: "unauthorized" }, 401);
+      await next();
+    });
+  }
+
+  app.route("/", ingestRoutes(repo, { evalEnabled }));
+  app.route("/", otelRoutes(repo, { evalEnabled }));
+  app.route("/", restRoutes(repo, judges));
+  app.route("/", uiRoutes(repo));
+  // form handler lives here because it needs the judge
+  app.post("/traces/:id/evaluate", async (c) => {
+    const id = c.req.param("id");
+    if (judges) for (const ev of repo.listEvaluators(true)) await evaluateTrace(repo, judges, ev, id, { force: true });
+    else scheduleTrace(repo, id, 0);
+    return c.redirect(`/traces/${id}`);
+  });
+  app.post("/traces/:id/escalate", async (c) => {
+    const id = c.req.param("id");
+    if (judges?.escalator) {
+      const seen = new Set<string>();
+      for (const jd of repo.listJudgments(id)) {
+        if (jd.status !== "ok" || jd.escalated_from) continue;
+        const key = `${jd.evaluator_id}:${jd.observation_id ?? ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const ev = repo.getEvaluator(jd.evaluator_id);
+        if (ev) await escalateJudgment(repo, judges.escalator, ev, jd);
+      }
+    }
+    return c.redirect(`/traces/${id}`);
+  });
+
+  const worker = judges && evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? { info() {}, warn() {}, error() {} } : console) : null;
+  return { app, repo, db, judge, escalator, worker };
+}
+
+const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop()!);
+if (isMain) {
+  const { app, judge, escalator, worker } = createApp();
+  worker?.start();
+  serve({ fetch: app.fetch, port: config.port }, (info) => {
+    console.log(`openeva listening on http://localhost:${info.port}  db=${config.dbPath}`);
+    if (judge) console.log(`eval: on (model ${judge.model}, settle ${config.settleMs}ms, state budget ${config.stateBudgetChars} chars)`);
+    else console.log("eval: OFF — set TYPESAFE_API_KEY to enable jev judgments; traces are still recorded");
+    if (judge) console.log(escalator ? `escalation: on (${escalator.model} when jev confidence < ${config.reviewConfidence})` : "escalation: off — set ANTHROPIC_API_KEY to get rationales on low-confidence judgments");
+  });
+}

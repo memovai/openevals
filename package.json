@@ -1,0 +1,32 @@
+{
+  "name": "openeva",
+  "version": "0.1.0",
+  "description": "Cheap, fast agent-trajectory observability + eval. Langfuse-shaped data model in one SQLite file; jev (TypeSafe) as the judge.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx watch src/server.ts",
+    "start": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx src/server.ts",
+    "demo": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx examples/agent-demo.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
+    "@hono/node-server": "^2.1.1",
+    "@typesafe-ai/sdk": "^0.6.0",
+    "hono": "^4.13.8",
+    "protobufjs": "^8.8.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
