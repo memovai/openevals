@@ -57,8 +57,8 @@ form.inline{display:inline}button{font:inherit;padding:4px 10px;border:1px solid
 function layout(title: string, body: unknown, stats: { traces: number; cost: number; queue: Record<string, number> }) {
   const pending = (stats.queue.pending ?? 0) + (stats.queue.running ?? 0);
   return html`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} · openeva</title><style>${raw(CSS)}</style></head>
-<body><header><b><a href="/" style="color:inherit">openeva</a></b><nav><a href="/">Traces</a><a href="/review">Review</a><a href="/evaluators">Evaluators</a><a href="/datasets">Datasets</a><a href="/calibration">Calibration</a><a href="/api/v1/stats">API</a></nav>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} · openevals</title><style>${raw(CSS)}</style></head>
+<body><header><b><a href="/" style="color:inherit">openevals</a></b><nav><a href="/">Traces</a><a href="/review">Review</a><a href="/evaluators">Evaluators</a><a href="/datasets">Datasets</a><a href="/calibration">Calibration</a><a href="/api/v1/stats">API</a></nav>
 <span class="stats">${stats.traces} traces · eval spend $${stats.cost.toFixed(4)}${pending ? ` · ${pending} queued` : ""}</span></header>
 <main>${body}</main></body></html>`;
 }

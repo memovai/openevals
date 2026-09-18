@@ -87,7 +87,7 @@ if (isMain) {
   const { app, judge, escalator, worker } = createApp();
   worker?.start();
   serve({ fetch: app.fetch, port: config.port }, (info) => {
-    console.log(`openeva listening on http://localhost:${info.port}  db=${config.dbPath}`);
+    console.log(`openevals listening on http://localhost:${info.port}  db=${config.dbPath}`);
     if (judge) console.log(`eval: on (model ${judge.model}, settle ${config.settleMs}ms, state budget ${config.stateBudgetChars} chars)`);
     else console.log("eval: code graders only — set TYPESAFE_API_KEY to enable jev judgments");
     if (judge) console.log(escalator ? `escalation: on (${escalator.model} when jev confidence < ${config.reviewConfidence})` : "escalation: off — set ANTHROPIC_API_KEY to get rationales on low-confidence judgments");

@@ -1,11 +1,11 @@
 // Emits two synthetic agent trajectories (one good, one that loops and
-// fabricates) to a running openeva server, then waits for jev's verdicts.
+// fabricates) to a running openevals server, then waits for jev's verdicts.
 //   pnpm start            # in one terminal
 //   pnpm demo             # in another
-import { OpenEva } from "../src/sdk/index.js";
+import { OpenEvals } from "../src/sdk/index.js";
 
-const base = process.env.OPENEVA_URL ?? "http://localhost:3100";
-const eva = new OpenEva({ baseUrl: base, flushIntervalMs: 0 });
+const base = process.env.OPENEVALS_URL ?? "http://localhost:3100";
+const eva = new OpenEvals({ baseUrl: base, flushIntervalMs: 0 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function goodRun() {

@@ -63,7 +63,7 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
     const t = repo.getTrace(c.req.param("id"));
     if (!t) return c.json({ error: "not found" }, 404);
     const esc = judges.escalator;
-    if (!esc) return c.json({ error: "escalation disabled: ANTHROPIC_API_KEY not set or OPENEVA_ESCALATE=false" }, 503);
+    if (!esc) return c.json({ error: "escalation disabled: ANTHROPIC_API_KEY not set or OPENEVALS_ESCALATE=false" }, 503);
     const only = c.req.query("evaluator");
     const results: Record<string, unknown> = {};
     const seen = new Set<string>();

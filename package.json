@@ -1,5 +1,5 @@
 {
-  "name": "openeva",
+  "name": "openevals",
   "version": "0.1.0",
   "description": "Cheap, fast agent-trajectory observability + eval. Langfuse-shaped data model in one SQLite file; jev (TypeSafe) as the judge.",
   "type": "module",

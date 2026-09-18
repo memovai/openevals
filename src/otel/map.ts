@@ -171,7 +171,7 @@ export function mapSpan(s: OtelSpan, _spanIdsInBatch: Set<string>): Mapped {
     session_id: first(str(a["langfuse.session.id"]), str(a["session.id"]), str(a["gen_ai.conversation.id"])),
     input: first(jsonish(a["langfuse.trace.input"]), isRoot ? observation.input : undefined),
     output: first(jsonish(a["langfuse.trace.output"]), isRoot ? observation.output : undefined),
-    expected_output: jsonish(a["openeva.trace.expected_output"]) ?? jsonish(a["langfuse.trace.expected_output"]),
+    expected_output: jsonish(a["openevals.trace.expected_output"]) ?? jsonish(a["langfuse.trace.expected_output"]),
     metadata: collectPrefixed(a, "langfuse.trace.metadata"),
     tags: Array.isArray(tags) ? tags : typeof tags === "string" ? [tags] : undefined,
     release: first(str(a["langfuse.release"]), str(r["service.version"])),
@@ -182,7 +182,7 @@ export function mapSpan(s: OtelSpan, _spanIdsInBatch: Set<string>): Mapped {
   return { trace, observation, isRoot };
 }
 
-const KNOWN_PREFIXES = ["langfuse.", "gen_ai.", "llm.", "ai.", "input.", "output.", "openinference.", "session.", "user.", "tool.", "openeva."];
+const KNOWN_PREFIXES = ["langfuse.", "gen_ai.", "llm.", "ai.", "input.", "output.", "openinference.", "session.", "user.", "tool.", "openevals."];
 function residualMetadata(a: Record<string, AttrValue>): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
   let any = false;

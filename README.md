@@ -1,4 +1,4 @@
-# openeva
+# openevals
 
 Cheap, fast observability + eval for agent trajectories.
 
@@ -22,8 +22,8 @@ Without `TYPESAFE_API_KEY` the server still records traces; evaluation is just o
 **Built-in SDK** (`src/sdk/index.ts`, zero deps):
 
 ```ts
-import { OpenEva } from "openeva/sdk";
-const eva = new OpenEva({ baseUrl: "http://localhost:3100" });
+import { OpenEvals } from "openevals/sdk";
+const eva = new OpenEvals({ baseUrl: "http://localhost:3100" });
 
 const trace = eva.trace({ name: "research-agent", input: task, tags: ["prod"], expectedOutput: reference /* optional */ });
 const agent = trace.agent({ name: "researcher" });
@@ -35,17 +35,17 @@ trace.update({ output: finalAnswer });
 await eva.flush();
 ```
 
-**Langfuse SDKs (any version)**: set `LANGFUSE_HOST=http://localhost:3100`. v2 SDKs hit the batch API (`POST /api/public/ingestion`); v3+/v4 SDKs export OTLP to `POST /api/public/otel/v1/traces`. Both are served. If `OPENEVA_API_KEY` is set, the Langfuse *secret key* must equal it.
+**Langfuse SDKs (any version)**: set `LANGFUSE_HOST=http://localhost:3100`. v2 SDKs hit the batch API (`POST /api/public/ingestion`); v3+/v4 SDKs export OTLP to `POST /api/public/otel/v1/traces`. Both are served. If `OPENEVALS_API_KEY` is set, the Langfuse *secret key* must equal it.
 
-**Any OpenTelemetry exporter**: point OTLP/HTTP at `http://localhost:3100/v1/traces` (protobuf or JSON, gzip ok). Span attributes are mapped from Langfuse's OTel conventions (`langfuse.observation.*`, `langfuse.trace.*`, `langfuse.session.id`, …), OTel GenAI semconv (`gen_ai.*`), OpenInference (`openinference.span.kind`, `input.value`, `llm.token_count.*`), OpenLLMetry (`gen_ai.prompt.N.*`) and the Vercel AI SDK (`ai.*`). The root span's input/output become the trace's input/output unless `langfuse.trace.input/output` are set. Set `openeva.trace.expected_output` on the root span to enable outcome grading.
+**Any OpenTelemetry exporter**: point OTLP/HTTP at `http://localhost:3100/v1/traces` (protobuf or JSON, gzip ok). Span attributes are mapped from Langfuse's OTel conventions (`langfuse.observation.*`, `langfuse.trace.*`, `langfuse.session.id`, …), OTel GenAI semconv (`gen_ai.*`), OpenInference (`openinference.span.kind`, `input.value`, `llm.token_count.*`), OpenLLMetry (`gen_ai.prompt.N.*`) and the Vercel AI SDK (`ai.*`). The root span's input/output become the trace's input/output unless `langfuse.trace.input/output` are set. Set `openevals.trace.expected_output` on the root span to enable outcome grading.
 
 ## How evaluation works
 
-1. Every ingested event re-schedules the trace; after `OPENEVA_SETTLE_MS` of quiet the worker picks it up.
+1. Every ingested event re-schedules the trace; after `OPENEVALS_SETTLE_MS` of quiet the worker picks it up.
 2. `eval/state.ts` compacts the trajectory into a JSON `state` under jev's 32k-token budget (per-field truncation → head/tail elision → last-resort clipping). Deterministic, so the state hash is a cache key: identical data is never judged twice.
 3. Each enabled evaluator = one `POST /v1/systemone` with all its questions. Answers become `scores` rows (`source = EVAL`): Noul → numeric P(yes); Score → numeric level (+ probabilities/confidence in metadata); Choice → categorical.
 4. `composite` (in code) turns the atomic answers into `trajectory_quality` (0–1) and `passed` (boolean).
-5. **Escalation.** If jev's minimum `confidence` is below `OPENEVA_REVIEW_CONFIDENCE` (or a Noul lands within `OPENEVA_ESCALATE_NOUL_BAND` of 0.5), the same state and questions go to a reasoning model (`claude-opus-5` by default, needs `ANTHROPIC_API_KEY`) with a strict JSON output schema. Its answers replace the jev scores and its **rationale** lands in each score's `comment`. Without an escalator the judgment is just flagged `needs_review`. Force a second opinion any time with `POST /api/v1/traces/:id/escalate`.
+5. **Escalation.** If jev's minimum `confidence` is below `OPENEVALS_REVIEW_CONFIDENCE` (or a Noul lands within `OPENEVALS_ESCALATE_NOUL_BAND` of 0.5), the same state and questions go to a reasoning model (`claude-opus-5` by default, needs `ANTHROPIC_API_KEY`) with a strict JSON output schema. Its answers replace the jev scores and its **rationale** lands in each score's `comment`. Without an escalator the judgment is just flagged `needs_review`. Force a second opinion any time with `POST /api/v1/traces/:id/escalate`.
 6. The exact `state`, `questions`, raw `answers`, model version, tokens, cost, latency are stored in `judgments` for audit. An escalation judgment points at the jev judgment it replaced via `escalated_from`.
 
 ### Trace-level vs observation-level
@@ -122,7 +122,7 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 
 ## How this maps to Anthropic's "Demystifying evals for AI agents"
 
-| guide | openeva |
+| guide | openevals |
 |---|---|
 | Three grader types: code, model, human | `kind: "code"` evaluators (free), jev evaluators (typed questions), ANNOTATION scores via UI/API |
 | "grade each dimension with an isolated LLM-as-judge" | jev evaluates every question independently against the same state — one request, isolated judgments by construction |

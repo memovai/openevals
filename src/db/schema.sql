@@ -1,5 +1,5 @@
 -- Data model follows Langfuse (MIT): trace -> observations (tree) ; scores attach to
--- a trace or an observation. openeva adds evaluators / judgments / eval_queue for the
+-- a trace or an observation. openevals adds evaluators / judgments / eval_queue for the
 -- jev-based eval layer, and expected_output on traces for outcome grading.
 
 CREATE TABLE IF NOT EXISTS traces (
@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS traces (
   session_id      TEXT,
   input           TEXT,            -- JSON
   output          TEXT,            -- JSON
-  expected_output TEXT,            -- JSON (openeva extension)
+  expected_output TEXT,            -- JSON (openevals extension)
   metadata        TEXT,            -- JSON object
   tags            TEXT,            -- JSON array of strings
   release         TEXT,

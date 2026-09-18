@@ -1,7 +1,7 @@
 // Tiny client SDK. Zero dependencies; speaks the Langfuse batch-event wire
 // format, so the same server also accepts real Langfuse SDKs.
 //
-//   const eva = new OpenEva({ baseUrl: "http://localhost:3100" });
+//   const eva = new OpenEvals({ baseUrl: "http://localhost:3100" });
 //   const trace = eva.trace({ name: "support-agent", input: userMessage });
 //   const gen = trace.generation({ name: "plan", model: "claude-sonnet-5", input: msgs });
 //   gen.end({ output: reply, usage: { input: 812, output: 120 } });
@@ -11,7 +11,7 @@
 //   await eva.flush();
 import { randomUUID } from "node:crypto";
 
-export interface OpenEvaOptions {
+export interface OpenEvalsOptions {
   baseUrl?: string;
   apiKey?: string;
   /** flush automatically after this many ms of inactivity (default 1000; 0 = manual) */
@@ -72,7 +72,7 @@ interface Event {
 
 const iso = (d?: Date) => (d ?? new Date()).toISOString();
 
-export class OpenEva {
+export class OpenEvals {
   private queue: Event[] = [];
   private timer: NodeJS.Timeout | null = null;
   private inflight: Promise<void> | null = null;
@@ -82,9 +82,9 @@ export class OpenEva {
   private readonly batchSize: number;
   private readonly fetchImpl: typeof fetch;
 
-  constructor(opts: OpenEvaOptions = {}) {
-    this.baseUrl = (opts.baseUrl ?? process.env.OPENEVA_URL ?? "http://localhost:3100").replace(/\/$/, "");
-    this.apiKey = opts.apiKey ?? process.env.OPENEVA_API_KEY;
+  constructor(opts: OpenEvalsOptions = {}) {
+    this.baseUrl = (opts.baseUrl ?? process.env.OPENEVALS_URL ?? "http://localhost:3100").replace(/\/$/, "");
+    this.apiKey = opts.apiKey ?? process.env.OPENEVALS_API_KEY;
     this.flushIntervalMs = opts.flushIntervalMs ?? 1000;
     this.batchSize = opts.batchSize ?? 100;
     this.fetchImpl = opts.fetch ?? fetch;
@@ -141,7 +141,7 @@ export class OpenEva {
           headers: { "content-type": "application/json", ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}) },
           body: JSON.stringify({ batch: chunk }),
         });
-        if (!res.ok && res.status !== 207) throw new Error(`openeva ingest failed: ${res.status} ${await res.text()}`);
+        if (!res.ok && res.status !== 207) throw new Error(`openevals ingest failed: ${res.status} ${await res.text()}`);
       }
     })();
     try {
@@ -158,7 +158,7 @@ export class OpenEva {
 
 export class Trace {
   constructor(
-    private client: OpenEva,
+    private client: OpenEvals,
     public readonly id: string,
   ) {}
 
@@ -213,7 +213,7 @@ export class Trace {
 
 export class Observation {
   constructor(
-    private client: OpenEva,
+    private client: OpenEvals,
     public readonly trace: Trace,
     public readonly id: string,
     public readonly type: ObservationType,
