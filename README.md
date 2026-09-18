@@ -1,25 +1,46 @@
 # openevals
 
-Cheap, fast observability + eval for agent trajectories.
+**Online eval for agents: every trace, every step, written back to the observability tool you already use.**
 
-- **Data model copied from [Langfuse](https://github.com/langfuse/langfuse) (MIT):** `trace → observations (tree) → scores`. Langfuse SDKs can point straight at this server.
-- **One process, one SQLite file.** No ClickHouse / Redis / S3. Uses Node's built-in `node:sqlite`, so there are no native dependencies.
-- **[jev](https://typesafe.ai) is the judge.** jev does not generate text; it answers typed questions (Choice / Score / Noul) with calibrated probabilities. An "LLM-as-judge" rubric is therefore a set of atomic questions asked in **one request per trace**, and the weights / pass rules live in code. ≈ $0.001 per trace, ~1 s.
-- **Every step is graded, not just the outcome.** jev is fast and cheap enough (~100 ms) to judge each tool call and LLM step of a run concurrently. The per-step answers are folded into the trace-level state, so long runs are graded from a complete skeleton instead of a truncated dump, and roll up into credit-assignment metrics (where it first went off track, how much was wasted, how long it stalled, whether it recovered from errors).
-- **Rubrics are designed for jev, with feedback.** Lint, per-question calibration against human verdicts, a backtest endpoint, starter templates per agent type, and a compiler that turns a prose rubric into jev questions. See [docs/designing-for-jev.md](docs/designing-for-jev.md).
+Langfuse (and the other observability platforms) grade production traces with your GPT/Claude key at $0.01–0.10 a call, so they sample 1–10% and judge the trace as a whole. openevals uses [jev](https://typesafe.ai), a typed judge at $0.042 per million tokens and ~100 ms, to grade **100% of traces and every step inside them**, then writes the scores back into Langfuse where your team already looks. It also tells you which of your metrics jev can be trusted on.
 
-## Run
+- **Langfuse connector.** Pulls settled observations from `GET /api/public/v2/observations` (the only real-time read path), judges them, and writes scores back via the ingestion API with `observationId` for per-step scores and jev's probabilities in `metadata`. Failed or low-confidence traces are pushed into a Langfuse annotation queue; the human verdicts flow back for calibration. Zero code changes on your side: paste three env vars.
+- **Every step is graded.** Each tool call and LLM step gets four atomic questions (progress / on task / redundant / corrective), judged concurrently, with the previous steps as context — something Langfuse's own observation-level evaluators cannot see. Answers fold into the trace-level state so long runs are graded from a complete skeleton, and roll up into credit-assignment metrics (`first_off_task_step`, `longest_stall`, `wasted_fraction`, `error_recovery_rate`).
+- **Rubrics designed for jev, with feedback.** jev answers typed questions (Noul / Score / Choice) and never writes prose; weights and pass rules live in code. Lint, per-question calibration against human verdicts, a backtest endpoint, templates per agent type, and a compiler that turns a prose rubric into jev questions. See [docs/designing-for-jev.md](docs/designing-for-jev.md).
+- **Budgeted.** A process-wide limiter keeps jev under its published 1,200 requests/min, per-step grading samples very long runs, and an optional daily spend cap pauses model graders. Background: [docs/online-eval-research.md](docs/online-eval-research.md).
+- **One process, one SQLite file.** The local store holds the trace snapshot, every judgment (exact state and answers, for audit), the hash cache, and evaluators. Langfuse stays the system of record for traces. Direct ingestion (Langfuse-compatible batch API, OTLP, built-in SDK) still works as a fast lane for setups that need second-level latency.
+
+## Run with Langfuse
 
 ```bash
 pnpm install
-cp .env.example .env         # add TYPESAFE_API_KEY (+ ANTHROPIC_API_KEY for escalation)
+cp .env.example .env
+# TYPESAFE_API_KEY=...                       jev
+# LANGFUSE_HOST=https://cloud.langfuse.com  LANGFUSE_PUBLIC_KEY=pk-lf-...  LANGFUSE_SECRET_KEY=sk-lf-...
+# OPENEVALS_PUBLIC_URL=https://evals.example.com   (deep links from Langfuse scores back to the judgment page)
+# LANGFUSE_REVIEW_QUEUE_ID=...               optional: failed / unsure traces land in this annotation queue
+pnpm start                                   # http://localhost:3100 — the status page shows the connector loop
+```
+
+What happens every `LANGFUSE_POLL_MS` (30 s):
+
+1. **Pull.** Observations that started in `[watermark − LANGFUSE_OVERLAP_S, now − LANGFUSE_SETTLE_S)` are fetched (cursor-paged, `fields=basic,io,metadata,model,usage,trace_context`), grouped by trace, and upserted locally. A trace whose root started before the window is fetched whole by `traceId` so its task is known. Filters: `LANGFUSE_ENVIRONMENTS`, `LANGFUSE_TRACE_NAMES`.
+2. **Judge.** Code graders → per-step `step` evaluator → trace-level `trajectory` / `outcome`, as below. Identical states are never judged twice.
+3. **Write back.** Every EVAL score becomes a Langfuse score (`source=API`; `EVAL` is reserved for Langfuse's own evaluators): `value` + `dataType`, `observationId` for per-step scores, `comment` with the level description or rationale, `metadata.openevals` with probabilities, confidence, model, and a link to the judgment page. `LANGFUSE_WRITE_BACK_SCORES` / `LANGFUSE_WRITE_BACK_STEPS` narrow what is written. Traces that fail a pass gate or have a low-confidence judgment are added to `LANGFUSE_REVIEW_QUEUE_ID`, once.
+4. **Annotations.** Human scores (`source=ANNOTATION`) are pulled back; the one named `LANGFUSE_VERDICT_SCORE` (default `passed`) becomes the human verdict for `/calibration` and `POST /api/v1/evaluators/:id/backtest`.
+
+`GET /api/v1/sync` shows watermarks, counters and last errors; `POST /api/v1/sync/poll|writeback|annotations` runs a loop step now. Without `TYPESAFE_API_KEY` only the free code graders run.
+
+## Run without Langfuse (direct ingestion, the fast lane)
+
+```bash
 pnpm start                   # http://localhost:3100
 pnpm demo                    # sends two synthetic agent runs, prints jev's verdicts
 ```
 
-Without `TYPESAFE_API_KEY` the server still records traces; evaluation is just off.
+Traces sent straight to this server are graded the same way; scores stay local. Use this when you need judgments within seconds of a step (online early-stop) or have no Langfuse.
 
-## Send traces
+## Send traces directly
 
 **Built-in SDK** (`src/sdk/index.ts`, zero deps):
 
@@ -192,9 +213,11 @@ curl 'localhost:3100/api/v1/datasets/booking/runs/v12?compare=v11'
 | GET | `/api/v1/datasets/:name/runs/:run?compare=&pass=` | pass@1 / pass@k / pass^k, per-item, regressions |
 | GET | `/api/v1/review` | traces needing a human look |
 | GET | `/api/v1/calibration` | grader-vs-human agreement per score |
+| GET | `/api/v1/sync` | connector watermarks, counters, last errors; jev limiter and daily spend |
+| POST | `/api/v1/sync/poll`, `/api/v1/sync/writeback`, `/api/v1/sync/annotations` | run one connector step now |
 | GET | `/api/v1/stats`, `/api/v1/health` | |
 
-UI: `/` traces, `/traces/:id` progress strip + trajectory tree + probability bars per question + human verdict, `/review`, `/evaluators` (with lint and templates), `/datasets` (pass@k table), `/calibration` (score-level and per-question tables).
+UI: `/` status (connector loop, jev budget, recently judged), `/evaluators` (with lint and templates), `/calibration` (score-level and per-question tables), `/review`, `/traces` judgments list, `/traces/:id` progress strip + trajectory tree + probability bars per question, deep link to Langfuse. `/datasets` (pass@k table) is kept for direct-ingestion setups.
 
 ## Layout
 
@@ -222,10 +245,13 @@ src/
   eval/diagnostics.ts per-question calibration (undecided rate, constancy, AUC vs human verdict)
   eval/templates.ts starter rubrics per agent type
   eval/compile.ts  prose rubric → jev questions (Claude, structured output, lint + one repair)
-  eval/worker.ts   queue, per-trace ordering, concurrent per-step judging, caching
+  eval/worker.ts   queue, per-trace ordering, concurrent per-step judging, caching, daily budget
+  sources/langfuse/client.ts   v2 observations · ingestion · v3 scores · annotation queues
+  sources/langfuse/map.ts      Langfuse observations → trace/observation rows
+  sources/langfuse/sync.ts     pull / write-back / annotation loops with watermarks
   sdk/index.ts     client SDK
 ```
 
 ## Not yet
 
-Multi-project auth, OTLP metrics/logs (traces only), sampling for high-volume traffic.
+Other sources behind the same connector shape (Arize Phoenix, LangSmith); reading Langfuse dataset runs for pass@k; Langfuse score configs so BOOLEAN / CATEGORICAL scores render with their categories; multi-project auth; OTLP metrics/logs (traces only).

@@ -16,7 +16,7 @@ import type { ObservationRow, ScoreRow, TraceRow } from "../src/db/repo.js";
 const now = "2026-09-18T00:00:00.000Z";
 const trace = (over: Partial<TraceRow> = {}): TraceRow => ({
   id: "t1", project_id: "default", name: "agent", user_id: null, session_id: null, input: "do the thing", output: "done", expected_output: null,
-  metadata: null, tags: null, release: null, version: null, environment: null, timestamp: now, created_at: now, updated_at: now, ...over,
+  metadata: null, tags: null, release: null, version: null, environment: null, source: "local", external_url: null, timestamp: now, created_at: now, updated_at: now, ...over,
 });
 const obs = (i: number, over: Partial<ObservationRow> = {}): ObservationRow => ({
   id: `o${i}`, trace_id: "t1", parent_observation_id: null, type: "TOOL", name: `tool${i}`, start_time: now, end_time: "2026-09-18T00:00:01.000Z",

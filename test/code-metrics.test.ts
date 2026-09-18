@@ -8,7 +8,7 @@ import type { Judge } from "../src/eval/jev.js";
 const now = "2026-09-18T00:00:00.000Z";
 const trace = (over: Partial<TraceRow> = {}): TraceRow => ({
   id: "t1", project_id: "default", name: "agent", user_id: null, session_id: null, input: "q", output: "The answer is 42.", expected_output: "42",
-  metadata: null, tags: null, release: null, version: null, environment: null, timestamp: now, created_at: now, updated_at: now, ...over,
+  metadata: null, tags: null, release: null, version: null, environment: null, source: "local", external_url: null, timestamp: now, created_at: now, updated_at: now, ...over,
 });
 const obs = (i: number, over: Partial<ObservationRow> = {}): ObservationRow => ({
   id: `o${i}`, trace_id: "t1", parent_observation_id: null, type: "TOOL", name: "search", start_time: now, end_time: "2026-09-18T00:00:02.000Z",

@@ -427,6 +427,20 @@ export class EvalWorker {
     this.timer = null;
   }
 
+  private budgetWarnedDay = "";
+  /** OPENEVALS_DAILY_BUDGET_USD: once today's judgment spend exceeds it, jev evaluators wait for tomorrow. */
+  private overBudget(): boolean {
+    if (!config.dailyBudgetUsd) return false;
+    const day = new Date().toISOString().slice(0, 10);
+    const spent = this.repo.judgmentCostSince(`${day}T00:00:00.000Z`);
+    const over = spent >= config.dailyBudgetUsd;
+    if (over && this.budgetWarnedDay !== day) {
+      this.budgetWarnedDay = day;
+      this.log.warn(`[eval] daily budget reached ($${spent.toFixed(4)} ≥ $${config.dailyBudgetUsd}); jev evaluators paused until tomorrow`);
+    }
+    return over;
+  }
+
   /** Trace-level graders wait (bounded) for per-step graders so the step answers can be folded into their state. */
   private shouldWaitForSteps(traceId: string): boolean {
     const pending = this.repo.pendingObservationEvals(traceId);
@@ -454,6 +468,11 @@ export class EvalWorker {
           for (const { row, ev } of ordered) {
             if (!ev.enabled) {
               this.repo.finishQueue(row.trace_id, row.evaluator_id, "skipped");
+              continue;
+            }
+            if (ev.kind === "jev" && this.overBudget()) {
+              // leave the row pending; it is retried once the day rolls over
+              this.repo.deferQueue(row.trace_id, row.evaluator_id, new Date(Date.now() + 10 * 60_000).toISOString());
               continue;
             }
             if (ev.kind === "jev" && ev.target === "trace" && this.shouldWaitForSteps(row.trace_id)) {

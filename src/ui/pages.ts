@@ -5,10 +5,13 @@ import { Hono } from "hono";
 import { html, raw } from "hono/html";
 import type { Repo, ScoreRow, ObservationRow, JudgmentRow, TraceRow } from "../db/repo.js";
 import { runReport, calibration } from "../eval/metrics.js";
+import { config } from "../config.js";
 import { questionDiagnostics } from "../eval/diagnostics.js";
 import { lintEvaluator } from "../eval/lint.js";
 import { templates } from "../eval/templates.js";
 import { summarizeSteps } from "../eval/steps.js";
+import { jevLimiter } from "../eval/jev.js";
+import type { LangfuseSync } from "../sources/langfuse/sync.js";
 
 const esc = (s: unknown): string =>
   String(s ?? "")
@@ -64,7 +67,7 @@ function layout(title: string, body: unknown, stats: { traces: number; cost: num
   const pending = (stats.queue.pending ?? 0) + (stats.queue.running ?? 0);
   return html`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} · openevals</title><style>${raw(CSS)}</style></head>
-<body><header><b><a href="/" style="color:inherit">openevals</a></b><nav><a href="/">Traces</a><a href="/review">Review</a><a href="/evaluators">Evaluators</a><a href="/datasets">Datasets</a><a href="/calibration">Calibration</a><a href="/api/v1/stats">API</a></nav>
+<body><header><b><a href="/" style="color:inherit">openevals</a></b><nav><a href="/">Status</a><a href="/evaluators">Evaluators</a><a href="/calibration">Calibration</a><a href="/review">Review</a><a href="/traces">Judgments</a><a href="/api/v1/sync">API</a></nav>
 <span class="stats">${stats.traces} traces · eval spend $${stats.cost.toFixed(4)}${pending ? ` · ${pending} queued` : ""}</span></header>
 <main>${body}</main></body></html>`;
 }
@@ -186,7 +189,7 @@ function judgmentView(jd: JudgmentRow, evName: string, obsName?: string | null) 
   }
   const meta = jd.state_meta ?? {};
   const escLabel = jd.escalated_from ? ' · <span class="badge warn">escalated</span>' : "";
-  return `<div class="card"><h2>${title} <span class="muted">v${jd.evaluator_version} · ${esc(jd.model)} · ${fmtMs(jd.latency_ms)} · ${jd.usage_input} tok · $${(jd.cost_usd ?? 0).toFixed(6)}${jd.needs_review ? ' · <span class="lvl-WARNING">needs review</span>' : ""}${escLabel}</span></h2>
+  return `<div class="card" id="judgment-${esc(jd.id)}"><h2>${title} <span class="muted">v${jd.evaluator_version} · ${esc(jd.model)} · ${fmtMs(jd.latency_ms)} · ${jd.usage_input} tok · $${(jd.cost_usd ?? 0).toFixed(6)}${jd.needs_review ? ' · <span class="lvl-WARNING">needs review</span>' : ""}${escLabel}</span></h2>
     ${parts.join("")}
     <details style="margin-top:8px"><summary>state sent to jev (${meta.chars ?? "?"} chars${meta.truncated ? ", truncated" : ""})</summary><pre class="mono">${esc(pretty(jd.state))}</pre></details>
     <details><summary>questions</summary><pre class="mono">${esc(pretty(jd.questions))}</pre></details></div>`;
@@ -197,25 +200,83 @@ function bar(label: string, p: number, hl = false) {
   return `<div class="bar"><span class="lbl" title="${esc(label)}">${hl ? "<b>" : ""}${esc(label.length > 70 ? label.slice(0, 68) + "…" : label)}${hl ? "</b>" : ""}</span><div class="trk"><div class="fill" style="width:${pct.toFixed(1)}%"></div></div><span class="val mono">${(p * 100).toFixed(0)}%</span></div>`;
 }
 
-export function uiRoutes(repo: Repo): Hono {
+export function uiRoutes(repo: Repo, opts: { langfuse?: LangfuseSync | null } = {}): Hono {
   const app = new Hono();
+  const langfuse = opts.langfuse ?? null;
   const stats = () => ({ traces: repo.countTraces(), cost: Number(repo.judgmentStats().cost_usd ?? 0), queue: repo.queueStats() });
 
+  /** Home: what the online-eval loop is doing right now. */
   app.get("/", (c) => {
+    const st = langfuse ? langfuse.status() : null;
+    const startOfDay = new Date().toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const spent = repo.judgmentCostSince(startOfDay);
+    const lim = jevLimiter.stats;
+    const js = repo.judgmentStats();
+    const kv = (rows: [string, unknown][]) =>
+      `<table><tbody>${rows.map(([k, v]) => `<tr><td class="muted" style="width:45%">${esc(k)}</td><td class="mono">${esc(v == null ? "–" : String(v))}</td></tr>`).join("")}</tbody></table>`;
+    const recent = repo.recentlyJudged(25);
+    const scores = repo.scoresForTraces(recent.map((t) => t.id));
+    const rows = recent
+      .map((t) => {
+        const s = scores.get(t.id) ?? [];
+        return `<tr><td class="mono muted">${fmtTs(t.timestamp)}</td><td><a href="/traces/${esc(t.id)}">${esc(t.name ?? t.id.slice(0, 8))}</a>${t.external_url ? ` <a class="muted" href="${esc(t.external_url)}" target="_blank" rel="noopener">↗ ${esc(t.source)}</a>` : ""}</td><td>${scoreBadges(s)}</td></tr>`;
+      })
+      .join("");
+    const source = st
+      ? `<div class="card"><h2>Langfuse connector</h2>${kv([
+          ["host", st.host],
+          ["last poll", st.last_poll_at],
+          ["watermark", st.watermark],
+          ["observations pulled", st.observations_pulled],
+          ["traces pulled", st.traces_pulled],
+          ["scores written back", st.scores_written],
+          ["scores rejected", st.scores_rejected],
+          ["pending write-back", st.unsynced_scores],
+          ["annotations pulled", st.annotations_pulled],
+          ["review queue", st.review_queue],
+          ["last poll error", st.last_poll_error],
+          ["last write-back error", st.last_write_back_error],
+        ])}
+        <form class="inline" method="post" action="/sync/poll" style="margin-top:8px"><button>poll now</button></form>
+        <form class="inline" method="post" action="/sync/writeback"><button>write back now</button></form>
+        <form class="inline" method="post" action="/sync/annotations"><button>pull annotations</button></form></div>`
+      : `<div class="card"><h2>Source</h2><p class="muted">No Langfuse connector configured. Set <code>LANGFUSE_HOST</code>, <code>LANGFUSE_PUBLIC_KEY</code>, <code>LANGFUSE_SECRET_KEY</code> to pull traces from Langfuse and write scores back. Traces sent directly to this server (Langfuse SDK / OTLP / built-in SDK) are still graded.</p></div>`;
+    const body = html`<h1>Online eval</h1>
+      <div class="grid">
+        <div>${raw(source)}</div>
+        <div><div class="card"><h2>jev budget</h2>${raw(
+          kv([
+            ["requests last minute", `${lim.last_minute} / ${lim.rpm}`],
+            ["in flight", `${lim.in_flight} / ${lim.concurrency}`],
+            ["waiting", lim.waiting],
+            ["spent today", `$${spent.toFixed(4)}${config.dailyBudgetUsd ? ` / $${config.dailyBudgetUsd}` : ""}`],
+            ["judgments total", js.n],
+            ["spend total", `$${Number(js.cost_usd ?? 0).toFixed(4)}`],
+            ["avg latency", fmtMs(js.avg_latency_ms)],
+            ["needs review", js.needs_review],
+            ["queue", JSON.stringify(repo.queueStats())],
+          ]),
+        )}</div></div>
+      </div>
+      <div class="card"><h2>Recently judged</h2><table><thead><tr><th>Time</th><th>Trace</th><th>Scores</th></tr></thead><tbody>${raw(rows || '<tr><td colspan="3" class="muted">nothing judged yet</td></tr>')}</tbody></table></div>`;
+    return c.html(layout("Status", body, stats()));
+  });
+
+  app.get("/traces", (c) => {
     const q = c.req.query();
     const traces = repo.listTraces({ limit: 100, name: q.name, tag: q.tag, sessionId: q.sessionId });
     const scores = repo.scoresForTraces(traces.map((t) => t.id));
     const rows = traces
       .map((t: TraceRow) => {
         const s = scores.get(t.id) ?? [];
-        return `<tr><td class="mono muted">${fmtTs(t.timestamp)}</td><td><a href="/traces/${esc(t.id)}">${esc(t.name ?? t.id.slice(0, 8))}</a>${t.tags?.length ? `<br>${t.tags.map((x) => `<span class="badge muted">${esc(x)}</span>`).join("")}` : ""}</td>
+        return `<tr><td class="mono muted">${fmtTs(t.timestamp)}</td><td><a href="/traces/${esc(t.id)}">${esc(t.name ?? t.id.slice(0, 8))}</a>${t.external_url ? ` <a class="muted" href="${esc(t.external_url)}" target="_blank" rel="noopener">↗</a>` : ""}${t.tags?.length ? `<br>${t.tags.map((x) => `<span class="badge muted">${esc(x)}</span>`).join("")}` : ""}</td>
         <td class="muted mono">${esc(t.session_id ?? "")}</td><td class="mono muted" style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(pretty(t.input)).slice(0, 120)}</td><td>${scoreBadges(s)}</td></tr>`;
       })
       .join("");
-    const body = html`<h1>Traces</h1>
+    const body = html`<h1>Judgments</h1><p class="muted">Every trace this server has graded. Traces pulled from Langfuse link back to it; the judgment detail (state sent to jev, probability per question) lives here.</p>
       <table><thead><tr><th>Time</th><th>Name</th><th>Session</th><th>Input</th><th>Scores</th></tr></thead>
       <tbody>${raw(rows || `<tr><td colspan="5" class="muted">No traces yet. Point a Langfuse SDK at this server or run <code>pnpm demo</code>.</td></tr>`)}</tbody></table>`;
-    return c.html(layout("Traces", body, stats()));
+    return c.html(layout("Judgments", body, stats()));
   });
 
   app.get("/traces/:id", (c) => {
@@ -239,7 +300,7 @@ export function uiRoutes(repo: Repo): Hono {
       )
       .join("");
     const body = html`<h1>${esc(t.name ?? "trace")} <span class="muted mono" style="font-size:12px">${esc(t.id)}</span></h1>
-      <div class="muted" style="margin-bottom:12px">${fmtTs(t.timestamp)} ${t.session_id ? `· session <span class="mono">${esc(t.session_id)}</span>` : ""} ${t.user_id ? `· user <span class="mono">${esc(t.user_id)}</span>` : ""} · ${obs.length} steps
+      <div class="muted" style="margin-bottom:12px">${fmtTs(t.timestamp)} ${t.external_url ? raw(`· <a href="${esc(t.external_url)}" target="_blank" rel="noopener">open in ${esc(t.source)} ↗</a>`) : ""} ${t.session_id ? `· session <span class="mono">${esc(t.session_id)}</span>` : ""} ${t.user_id ? `· user <span class="mono">${esc(t.user_id)}</span>` : ""} · ${obs.length} steps
         <form class="inline" method="post" action="/traces/${esc(t.id)}/evaluate"><button>re-evaluate now</button></form>
         <form class="inline" method="post" action="/traces/${esc(t.id)}/escalate"><button>second opinion (reasoning model)</button></form></div>
       <div class="grid">
@@ -248,11 +309,13 @@ export function uiRoutes(repo: Repo): Hono {
           <div class="card"><h2>Output</h2><pre class="mono">${esc(pretty(t.output))}</pre></div>
           ${t.expected_output !== null && t.expected_output !== undefined ? raw(`<div class="card"><h2>Expected output</h2><pre class="mono">${esc(pretty(t.expected_output))}</pre></div>`) : ""}
           <div class="card"><h2>Scores</h2><table><thead><tr><th>Name</th><th class="right">Value</th><th>Source</th><th>Comment</th></tr></thead><tbody>${raw(scoreRows || '<tr><td colspan="4" class="muted">none yet</td></tr>')}</tbody></table></div>
-          <div class="card"><h2>Human verdict</h2><p class="muted" style="margin:0 0 8px">Your call becomes an ANNOTATION score named <code>passed</code>; it feeds the <a href="/calibration">calibration</a> report against the model graders.</p>
+          ${t.source === "langfuse"
+            ? raw(`<div class="card"><h2>Human verdict</h2><p class="muted" style="margin:0">Annotate this trace in Langfuse${t.external_url ? ` (<a href="${esc(t.external_url)}" target="_blank" rel="noopener">open ↗</a>)` : ""}; a score named <code>${esc(config.langfuse.verdictScore)}</code> is pulled back as the human verdict for <a href="/calibration">calibration</a>.</p></div>`)
+            : raw(`<div class="card"><h2>Human verdict</h2><p class="muted" style="margin:0 0 8px">Your call becomes an ANNOTATION score named <code>passed</code>; it feeds the <a href="/calibration">calibration</a> report against the model graders.</p>
             <form method="post" action="/traces/${esc(t.id)}/annotate" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <button name="verdict" value="1">✓ pass</button><button name="verdict" value="0">✗ fail</button>
               <input name="comment" placeholder="why (optional)" style="flex:1;min-width:200px;font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)">
-            </form></div>
+            </form></div>`)}
           ${raw([...latest.values()].map((jd) => judgmentView(jd, evNames.get(jd.evaluator_id) ?? jd.evaluator_id, jd.observation_id ? obsNames.get(jd.observation_id) ?? jd.observation_id : null)).join(""))}
         </div>
         <div><div class="card"><h2>Trajectory</h2>${progressStrip(obs, scores)}${obsTree(obs, scores)}</div>
@@ -359,6 +422,21 @@ export function uiRoutes(repo: Repo): Hono {
     }
     return c.redirect(`/traces/${id}`);
   });
+
+  for (const action of ["poll", "writeback", "annotations"] as const) {
+    app.post(`/sync/${action}`, async (c) => {
+      if (langfuse) {
+        try {
+          if (action === "poll") await langfuse.pollOnce();
+          else if (action === "writeback") await langfuse.writeBackOnce();
+          else await langfuse.pullAnnotationsOnce();
+        } catch {
+          /* surfaced on the status page via sync_state */
+        }
+      }
+      return c.redirect("/");
+    });
+  }
 
   // tiny form handlers (redirect back)
   app.post("/evaluators/:id/toggle", (c) => {

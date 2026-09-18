@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS traces (
   release         TEXT,
   version         TEXT,
   environment     TEXT,
+  source          TEXT NOT NULL DEFAULT 'local', -- local (ingested directly) | langfuse (pulled by the connector)
+  external_url    TEXT,            -- deep link into the source system
   timestamp       TEXT NOT NULL,   -- ISO 8601
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
@@ -62,9 +64,11 @@ CREATE TABLE IF NOT EXISTS scores (
   metadata       TEXT,                      -- JSON (probabilities, confidence, legend, ...)
   evaluator_id   TEXT,
   judgment_id    TEXT,
+  synced_at      TEXT,                      -- when the score was written back to the source system
   timestamp      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scores_trace ON scores(trace_id);
+CREATE INDEX IF NOT EXISTS idx_scores_unsynced ON scores(source, synced_at) WHERE synced_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_scores_name ON scores(name);
 
 CREATE TABLE IF NOT EXISTS evaluators (
@@ -121,6 +125,13 @@ CREATE TABLE IF NOT EXISTS eval_queue (
   PRIMARY KEY (trace_id, evaluator_id)
 );
 CREATE INDEX IF NOT EXISTS idx_queue_due ON eval_queue(status, not_before);
+
+-- Connector state: watermarks and counters per source (e.g. langfuse:observations_watermark).
+CREATE TABLE IF NOT EXISTS sync_state (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS datasets (
   id          TEXT PRIMARY KEY,

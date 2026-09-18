@@ -28,6 +28,10 @@ function migrate(db: DB): void {
   addColumn("judgments", "escalated_from", "TEXT");
   addColumn("judgments", "rationales", "TEXT");
   addColumn("evaluators", "kind", "TEXT NOT NULL DEFAULT 'jev'");
+  addColumn("traces", "source", "TEXT NOT NULL DEFAULT 'local'");
+  addColumn("traces", "external_url", "TEXT");
+  addColumn("scores", "synced_at", "TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_scores_unsynced ON scores(source, synced_at) WHERE synced_at IS NULL");
 }
 
 export const nowIso = (): string => new Date().toISOString();

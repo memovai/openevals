@@ -11,6 +11,7 @@ import { uiRoutes } from "./ui/pages.js";
 import { judgeFromEnv, type Judge } from "./eval/jev.js";
 import { escalatorFromEnv, type Escalator } from "./eval/escalate.js";
 import { compilerFromEnv, type Compiler } from "./eval/compile.js";
+import { langfuseFromEnv, type LangfuseSync } from "./sources/langfuse/sync.js";
 import { EvalWorker, ensureBuiltins, escalateJudgment, evaluateTrace, orderEvaluators, scheduleTrace, type Judges } from "./eval/worker.js";
 import { builtinEvaluators } from "./eval/builtin.js";
 
@@ -19,6 +20,8 @@ export interface AppOptions {
   judge?: Judge | null;
   escalator?: Escalator | null;
   compiler?: Compiler | null;
+  /** Langfuse connector; undefined = from env, null = off */
+  langfuse?: LangfuseSync | null | ((repo: Repo, schedule: (traceId: string, settleMs?: number) => void) => LangfuseSync | null);
   apiKey?: string;
   evalEnabled?: boolean;
   quiet?: boolean;
@@ -57,8 +60,11 @@ export function createApp(opts: AppOptions = {}) {
 
   app.route("/", ingestRoutes(repo, { schedule }));
   app.route("/", otelRoutes(repo, { schedule }));
-  app.route("/", restRoutes(repo, judges, schedule, { compiler }));
-  app.route("/", uiRoutes(repo));
+  const quietLog = { info() {}, warn() {}, error() {} };
+  const langfuse = typeof opts.langfuse === "function" ? opts.langfuse(repo, schedule) : opts.langfuse === undefined ? langfuseFromEnv(repo, schedule, opts.quiet ? quietLog : console) : opts.langfuse;
+
+  app.route("/", restRoutes(repo, judges, schedule, { compiler, langfuse }));
+  app.route("/", uiRoutes(repo, { langfuse }));
   // form handler lives here because it needs the judge
   app.post("/traces/:id/evaluate", async (c) => {
     const id = c.req.param("id");
@@ -81,14 +87,15 @@ export function createApp(opts: AppOptions = {}) {
     return c.redirect(`/traces/${id}`);
   });
 
-  const worker = evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? { info() {}, warn() {}, error() {} } : console) : null;
-  return { app, repo, db, judge, escalator, compiler, worker };
+  const worker = evalEnabled ? new EvalWorker(repo, judges, opts.quiet ? quietLog : console) : null;
+  return { app, repo, db, judge, escalator, compiler, worker, langfuse };
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop()!);
 if (isMain) {
-  const { app, judge, escalator, compiler, worker } = createApp();
+  const { app, judge, escalator, compiler, worker, langfuse } = createApp();
   worker?.start();
+  langfuse?.start();
   serve({ fetch: app.fetch, port: config.port }, (info) => {
     console.log(`openevals listening on http://localhost:${info.port}  db=${config.dbPath}`);
     if (judge) console.log(`eval: on (model ${judge.model}, settle ${config.settleMs}ms, state budget ${config.stateBudgetChars} chars)`);
@@ -96,5 +103,11 @@ if (isMain) {
     if (judge) console.log(escalator ? `escalation: on (${escalator.model} when jev confidence < ${config.reviewConfidence})` : "escalation: off — set ANTHROPIC_API_KEY to get rationales on low-confidence judgments");
     if (judge) console.log(`per-step grading: on (concurrency ${config.stepConcurrency}, max ${config.stepMaxPerTrace} steps/trace) — disable the \`step\` evaluator to turn it off`);
     console.log(compiler ? `rubric compiler: on (${compiler.model}) — POST /api/v1/evaluators/compile` : "rubric compiler: off — set ANTHROPIC_API_KEY to compile natural-language rubrics into jev questions");
+    console.log(
+      langfuse
+        ? `langfuse: pulling ${config.langfuse.host} every ${config.langfuse.pollMs}ms (settle ${config.langfuse.settleS}s), write-back ${config.langfuse.writeBack ? "on" : "off"}${config.langfuse.reviewQueueId ? `, review queue ${config.langfuse.reviewQueueId}` : ""}`
+        : "langfuse: off — set LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY to pull traces and write scores back",
+    );
+    console.log(`jev budget: ${config.jevRpm} req/min, ${config.jevConcurrency} in flight${config.dailyBudgetUsd ? `, $${config.dailyBudgetUsd}/day` : ""}`);
   });
 }

@@ -20,6 +20,9 @@ export interface TraceRow {
   release: string | null;
   version: string | null;
   environment: string | null;
+  /** local = ingested directly; langfuse = pulled by the connector */
+  source: string;
+  external_url: string | null;
   timestamp: string;
   created_at: string;
   updated_at: string;
@@ -62,6 +65,8 @@ export interface ScoreRow {
   metadata: Record<string, unknown> | null;
   evaluator_id: string | null;
   judgment_id: string | null;
+  /** when the score was written back to the source system (connector); null = pending or local */
+  synced_at?: string | null;
   timestamp: string;
 }
 
@@ -185,8 +190,8 @@ export class Repo {
       this.db
         .prepare(
           `INSERT INTO traces (id, project_id, name, user_id, session_id, input, output, expected_output, metadata, tags,
-             release, version, environment, timestamp, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             release, version, environment, source, external_url, timestamp, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           t.id,
@@ -202,6 +207,8 @@ export class Repo {
           t.release ?? null,
           t.version ?? null,
           t.environment ?? null,
+          t.source ?? "local",
+          t.external_url ?? null,
           t.timestamp ?? now,
           now,
           now,
@@ -220,6 +227,9 @@ export class Repo {
       release: t.release,
       version: t.version,
       environment: t.environment,
+      source: t.source,
+      external_url: t.external_url,
+      timestamp: t.timestamp,
     });
     const keys = Object.keys(patch);
     const sets = [...keys.map((k) => `${k} = ?`), "updated_at = ?"].join(", ");
@@ -709,6 +719,54 @@ export class Repo {
       metadata: pj<Record<string, unknown>>(r.metadata),
       human: r.human === null || r.human === undefined ? null : Number(r.human),
     }));
+  }
+
+  // ---------------- connector support ----------------
+  getSyncState(key: string): string | null {
+    const r = this.db.prepare("SELECT value FROM sync_state WHERE key = ?").get(key) as { value: string | null } | undefined;
+    return r?.value ?? null;
+  }
+  setSyncState(key: string, value: string | null): void {
+    this.db.prepare("INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(key, value, nowIso());
+  }
+  listSyncState(prefix: string): Record<string, string | null> {
+    const rows = this.db.prepare("SELECT key, value FROM sync_state WHERE key LIKE ? ORDER BY key").all(`${prefix}%`) as { key: string; value: string | null }[];
+    return Object.fromEntries(rows.map((r) => [r.key.slice(prefix.length), r.value]));
+  }
+  /** EVAL scores on traces from `source` that have not been written back yet, oldest first. */
+  unsyncedScores(source: string, limit = 200): (ScoreRow & { trace_source: string })[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT s.*, t.source AS trace_source FROM scores s JOIN traces t ON t.id = s.trace_id
+           WHERE s.source = 'EVAL' AND s.synced_at IS NULL AND t.source = ? ORDER BY s.timestamp ASC LIMIT ?`,
+        )
+        .all(source, limit) as Raw[]
+    ).map((r) => ({ ...scoreFromRaw(r), trace_source: String(r.trace_source) }));
+  }
+  markScoresSynced(ids: string[], at = nowIso()): void {
+    if (!ids.length) return;
+    this.db.prepare(`UPDATE scores SET synced_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`).run(at, ...ids);
+  }
+  /** Sum of judgment cost since an ISO timestamp (daily budget). */
+  judgmentCostSince(sinceIso: string): number {
+    const r = this.db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM judgments WHERE created_at >= ?").get(sinceIso) as { c: number };
+    return Number(r.c ?? 0);
+  }
+  /** Traces judged most recently (latest judgment per trace), for the status page. */
+  recentlyJudged(limit = 30): TraceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.* FROM traces t JOIN (SELECT trace_id, MAX(created_at) AS at FROM judgments GROUP BY trace_id) jd ON jd.trace_id = t.id
+         ORDER BY jd.at DESC LIMIT ?`,
+      )
+      .all(limit) as Raw[];
+    return rows.map(traceFromRaw);
+  }
+  /** Replace the human verdict annotation on a trace (used by the connector when pulling annotations). */
+  upsertAnnotation(s: Omit<ScoreRow, "id" | "timestamp"> & { id: string; timestamp?: string }): void {
+    this.db.prepare("DELETE FROM scores WHERE id = ?").run(s.id);
+    this.insertScore(s);
   }
 
   /** Traces with a human `passed` verdict, newest first — the labeled set for backtesting an evaluator. */

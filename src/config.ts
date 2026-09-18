@@ -43,6 +43,45 @@ export const config = {
   /** trace-level jev evaluators wait for per-step ones so their answers can be folded into the state */
   stepWaitMs: num(process.env.OPENEVALS_STEP_WAIT_MS, 2000),
 
+  // jev request budget. Published limits are 1,200 requests/min and 250k tokens/s; stay under them across
+  // all evaluators, and optionally cap daily spend (jev evaluators are skipped once it is hit).
+  jevRpm: num(process.env.OPENEVALS_JEV_RPM, 1000),
+  jevConcurrency: num(process.env.OPENEVALS_JEV_CONCURRENCY, 16),
+  dailyBudgetUsd: num(process.env.OPENEVALS_DAILY_BUDGET_USD, 0), // 0 = unlimited
+  /** public base URL of this server, used for deep links written into Langfuse score metadata */
+  publicUrl: (process.env.OPENEVALS_PUBLIC_URL || "").replace(/\/$/, ""),
+
+  // Langfuse connector: pull observations, judge, write scores back. Enabled when the three LANGFUSE_* vars are set.
+  langfuse: {
+    host: (process.env.LANGFUSE_HOST || process.env.LANGFUSE_BASE_URL || "").replace(/\/$/, ""),
+    publicKey: process.env.LANGFUSE_PUBLIC_KEY || undefined,
+    secretKey: process.env.LANGFUSE_SECRET_KEY || undefined,
+    pollMs: num(process.env.LANGFUSE_POLL_MS, 30_000),
+    /** observations younger than this are left for the next poll so a trace has settled before it is judged */
+    settleS: num(process.env.LANGFUSE_SETTLE_S, 90),
+    /** re-read this far behind the watermark to pick up late-arriving observations */
+    overlapS: num(process.env.LANGFUSE_OVERLAP_S, 300),
+    /** on first start, how far back to pull */
+    lookbackS: num(process.env.LANGFUSE_LOOKBACK_S, 3600),
+    pageLimit: num(process.env.LANGFUSE_PAGE_LIMIT, 500),
+    /** max observations per poll tick (bounds one tick's work) */
+    maxPerTick: num(process.env.LANGFUSE_MAX_PER_TICK, 5000),
+    /** only pull these environments (comma-separated); empty = all */
+    environments: (process.env.LANGFUSE_ENVIRONMENTS || "").split(",").map((x) => x.trim()).filter(Boolean),
+    /** only pull traces whose root observation has one of these names; empty = all */
+    traceNames: (process.env.LANGFUSE_TRACE_NAMES || "").split(",").map((x) => x.trim()).filter(Boolean),
+    /** annotation queue that low-confidence / failed traces are pushed into (optional) */
+    reviewQueueId: process.env.LANGFUSE_REVIEW_QUEUE_ID || undefined,
+    /** name of the human verdict score in Langfuse annotations; mapped to our `passed` for calibration */
+    verdictScore: process.env.LANGFUSE_VERDICT_SCORE || "passed",
+    /** write scores back at all (turn off to run read-only) */
+    writeBack: bool(process.env.LANGFUSE_WRITE_BACK, true),
+    /** which score names to write back; empty = every EVAL score. e.g. "passed,trajectory_quality,progress_mean" */
+    writeBackScores: (process.env.LANGFUSE_WRITE_BACK_SCORES || "").split(",").map((x) => x.trim()).filter(Boolean),
+    /** write per-step (observation-level) scores back too; they are numerous */
+    writeBackSteps: bool(process.env.LANGFUSE_WRITE_BACK_STEPS, true),
+  },
+
   // Rubric compiler (natural language → jev questions). Needs ANTHROPIC_API_KEY.
   compileModel: process.env.OPENEVALS_COMPILE_MODEL ?? process.env.OPENEVALS_ESCALATE_MODEL ?? "claude-sonnet-5",
 };

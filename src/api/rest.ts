@@ -1,6 +1,6 @@
 // JSON API: read traces/scores/judgments, manage evaluators & datasets,
 // trigger evaluations. Mirrors Langfuse's /api/public shapes where cheap.
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { Repo } from "../db/repo.js";
 import { evaluateTrace, escalateJudgment, orderEvaluators, stepContext, type Judges } from "../eval/worker.js";
@@ -11,10 +11,14 @@ import { lintEvaluator, hasErrors } from "../eval/lint.js";
 import { templates, templateById } from "../eval/templates.js";
 import { compileRubric, type Compiler } from "../eval/compile.js";
 import { config } from "../config.js";
+import { jevLimiter } from "../eval/jev.js";
+import type { LangfuseSync } from "../sources/langfuse/sync.js";
 
 export interface RestOptions {
   /** natural-language rubric → jev evaluator; null disables POST /api/v1/evaluators/compile */
   compiler?: Compiler | null;
+  /** Langfuse connector, when configured */
+  langfuse?: LangfuseSync | null;
 }
 
 export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: string, settleMs?: number) => void, opts: RestOptions = {}): Hono {
@@ -22,7 +26,31 @@ export function restRoutes(repo: Repo, judges: Judges, schedule: (traceId: strin
   const judge = judges.judge;
   const compiler = opts.compiler ?? null;
 
-  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges.escalator?.model ?? null, compiler: compiler?.model ?? null, codeGraders: true }));
+  const langfuse = opts.langfuse ?? null;
+  app.get("/api/v1/health", (c) => c.json({ ok: true, eval: !!judge, model: judge?.model ?? null, escalation: judges.escalator?.model ?? null, compiler: compiler?.model ?? null, codeGraders: true, source: langfuse ? "langfuse" : "local" }));
+
+  // ---- connector ----
+  const startOfDay = () => new Date(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z").toISOString();
+  app.get("/api/v1/sync", (c) =>
+    c.json({
+      source: langfuse ? "langfuse" : "local",
+      langfuse: langfuse ? langfuse.status() : null,
+      jev: { ...jevLimiter.stats, spent_today_usd: repo.judgmentCostSince(startOfDay()), daily_budget_usd: config.dailyBudgetUsd || null },
+      queue: repo.queueStats(),
+    }),
+  );
+  const syncAction = (fn: (lf: LangfuseSync) => Promise<unknown>) => async (c: Context) => {
+    if (!langfuse) return c.json({ error: "langfuse connector not configured (LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)" }, 503);
+    try {
+      return c.json({ ok: true, result: await fn(langfuse) });
+    } catch (e) {
+      return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502);
+    }
+  };
+  /** Run one pull / write-back / annotation pull now (the loops also run on their timers). */
+  app.post("/api/v1/sync/poll", syncAction((lf) => lf.pollOnce()));
+  app.post("/api/v1/sync/writeback", syncAction((lf) => lf.writeBackOnce()));
+  app.post("/api/v1/sync/annotations", syncAction((lf) => lf.pullAnnotationsOnce()));
 
   app.get("/api/v1/stats", (c) =>
     c.json({ traces: repo.countTraces(), scores: repo.scoreStats(), judgments: repo.judgmentStats(), queue: repo.queueStats() }),
